@@ -169,42 +169,20 @@ jobs:
           # 原厂 /proc/config.gz 实测有、而 gki_defconfig 默认没有的项：
           #   CONFIG_MODULE_SCMVERSION=y      给模块打 SCM 版本戳（depends on LOCALVERSION_AUTO）
           #   CONFIG_LOCALVERSION_AUTO=y      原厂 y；也是上一项的硬依赖
-          #   CONFIG_TRIM_UNUSED_KSYMS=y      裁剪未被引用的导出符号（原厂 y）
-          #   CONFIG_UNUSED_KSYMS_WHITELIST   裁剪白名单（原厂 "abi_symbollist.raw"）
           #   CONFIG_HEADERS_INSTALL=y        原厂 y
           #
-          # 白名单来源：实测本机全部 495 个厂商模块（vendor 399 + system 96）
-          # 的 __versions 段，提取出它们引用的每一个符号（共 4998 个），
-          # modpost 会把这些符号标记为 used 从而保留，确保裁剪不会伤到厂商模块。
+          # 已放弃（实测 bootloop）：
+          #   CONFIG_TRIM_UNUSED_KSYMS + CONFIG_UNUSED_KSYMS_WHITELIST
+          #   run#8 实测：白名单覆盖全部 495 个厂商模块引用的 4998 个符号，
+          #   编译期反查 0 误裁、CRC 0 冲突，但上机仍 bootloop。
+          #   结论：厂商模块还依赖某些「未被 __versions 记录」的符号
+          #   （如仅由内核内部导出、模块运行时通过 kallsyms 查找的那些），
+          #   裁剪它们同样致命。故本项不再启用。
           echo "CONFIG_MODULE_SCMVERSION=y" >> "$D"
           echo "CONFIG_LOCALVERSION_AUTO=y" >> "$D"
           echo "CONFIG_HEADERS_INSTALL=y" >> "$D"
-          echo "CONFIG_TRIM_UNUSED_KSYMS=y" >> "$D"
-          echo 'CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"' >> "$D"
           echo "=== 追加后的相关行 ==="
-          grep -nE "SCMVERSION|LOCALVERSION_AUTO|HEADERS_INSTALL|TRIM_UNUSED|UNUSED_KSYMS" "$D"
-
-      - name: '[原厂对齐] 铺入裁剪白名单 (abi_symbollist.raw)'
-        run: |
-          # 注意：本步骤在 actions/checkout 之前，$GITHUB_WORKSPACE/repo 尚不存在，
-          # 因此必须自行取回白名单文件（只取这一个文件，用 curl 而非全量 clone）
-          RAW="https://raw.githubusercontent.com/jingesui/ace5pro-oki-kernel/main/tools/abi_symbollist.raw"
-          curl -fsSL --retry 3 --max-time 60 "$RAW" -o /tmp/abi_symbollist.raw \
-            || curl -fsSL --retry 3 --max-time 60 \
-                 "https://ghproxy.net/https://raw.githubusercontent.com/jingesui/ace5pro-oki-kernel/main/tools/abi_symbollist.raw" \
-                 -o /tmp/abi_symbollist.raw
-          test -s /tmp/abi_symbollist.raw || { echo "::error::白名单下载失败"; exit 1; }
-
-          cd common
-          # 白名单必须位于源码树根：CONFIG_UNUSED_KSYMS_WHITELIST 是相对路径，
-          # Makefile.modpost 会补 $(srctree)/ 前缀
-          cp /tmp/abi_symbollist.raw ./abi_symbollist.raw
-          echo "白名单行数: $(wc -l < abi_symbollist.raw)"
-          echo "唯一性检查: $(sort -u abi_symbollist.raw | wc -l) (应等于总行数)"
-          # 关键符号抽查
-          for s in module_layout _printk kfree mutex_lock schedule; do
-            grep -qx "$s" abi_symbollist.raw && echo "  [OK] $s" || { echo "::error::白名单缺少 $s"; exit 1; }
-          done
+          grep -nE "SCMVERSION|LOCALVERSION_AUTO|HEADERS_INSTALL" "$D"
 
       - name: 生成配置
         run: |
@@ -296,55 +274,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: repo
-
-      # ─────────────────────────────────────────────────────────
-      # TRIM 反查：CONFIG_TRIM_UNUSED_KSYMS=y 会把"未被引用的导出符号"
-      # 从 ksymtab 中裁掉。白名单来自实测的 495 个厂商模块引用集合，
-      # 理论上是完备的；本步在编译后逐个反查，确认没有被误裁。
-      # 这是本配置唯一的 fail-fast 保护：一旦裁错，模块拒绝加载 → bootloop。
-      # ─────────────────────────────────────────────────────────
-      - name: '[TRIM 反查] 确认白名单符号未被误裁'
-        run: |
-          cd common
-          SYMVERS="$(pwd)/out/Module.symvers"
-          test -f "$SYMVERS" || { echo "::error::无 Module.symvers"; exit 1; }
-          MUST="$GITHUB_WORKSPACE/repo/tools/trim_must_keep.txt"
-          test -f "$MUST" || { echo "::error::trim_must_keep.txt 未 checkout"; exit 1; }
-
-          grep -qE '^CONFIG_TRIM_UNUSED_KSYMS=y' out/.config \
-            && echo "[确认] TRIM_UNUSED_KSYMS 已启用，执行反查" \
-            || { echo "::error::TRIM_UNUSED_KSYMS 未生效，白名单形同虚设"; exit 1; }
-          grep -qE '^CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"' out/.config \
-            || { echo "::error::UNUSED_KSYMS_WHITELIST 未生效"; exit 1; }
-
-          echo "Module.symvers 符号数: $(wc -l < "$SYMVERS")"
-          echo "必须保留清单:          $(wc -l < "$MUST")"
-
-          # 金丝雀：证明裁剪确实生效。
-          # 若 TRIM 静默失效，所有符号仍在 → "未误裁"检查会平凡通过（假保险）。
-          # 这两个符号在裁剪前存在、且不在白名单中，生效后必须消失。
-          CANARY_FAIL=0
-          for canary in LZ4_compress_HC HUF_readStats; do
-            if cut -f2 "$SYMVERS" | grep -qx "$canary"; then
-              echo "  [WARN] 金丝雀 $canary 仍存在 → 裁剪可能未真正生效"
-              CANARY_FAIL=1
-            else
-              echo "  [OK]   金丝雀 $canary 已被裁掉（证明 TRIM 生效）"
-            fi
-          done
-          if [ "$CANARY_FAIL" -ne 0 ]; then
-            echo "::error::TRIM 未生效，白名单保护形同虚设（编译继续但保护无效）"
-            exit 1
-          fi
-
-          MISSING=$(comm -23 <(sort -u "$MUST") <(cut -f2 "$SYMVERS" | sort -u) | wc -l)
-          echo "被误裁的符号数:        $MISSING"
-          if [ "$MISSING" -gt 0 ]; then
-            echo "::error::$MISSING 个白名单符号被裁掉，厂商模块将加载失败"
-            comm -23 <(sort -u "$MUST") <(cut -f2 "$SYMVERS" | sort -u) | head -30
-            exit 1
-          fi
-          echo "裁剪白名单反查通过 ✅ 未伤及任何厂商模块所需符号"
 
       # ─────────────────────────────────────────────────────────
       # CRC 把关：模块能否加载由符号 CRC 决定，而 CRC 是源码+配置经
