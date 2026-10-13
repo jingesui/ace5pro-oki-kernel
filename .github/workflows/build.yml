@@ -1,0 +1,98 @@
+name: Build Ace5Pro OKI Kernel 6.6.66
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: 清理磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev python3 cpio dwarves \
+            zip unzip curl git
+
+      - name: 下载 AOSP Clang r510928 (x86_64)
+        run: |
+          curl -L --retry 3 -o /tmp/clang.tar.gz \
+            https://github.com/s1lently/llvm-project/releases/download/r510928-arm64/aosp-clang-r510928-x86_64-kernel.tar.gz
+          mkdir -p "$HOME/clang"
+          tar xzf /tmp/clang.tar.gz -C /tmp
+          if [ -d /tmp/clang-kernel-only ]; then
+            mv /tmp/clang-kernel-only/* "$HOME/clang/"
+          fi
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          "$HOME/clang/bin/clang" --version | head -3 || true
+
+      - name: 克隆官方 OKI 源码 (Ace 5 Pro / OOS15 / 6.6.66)
+        run: |
+          git clone --depth=1 -b oneplus/sm8750_v_15.0.0_oneplus_ace5_pro \
+            https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750 common
+          echo "=== 确认内核版本 ==="
+          head -5 common/Makefile
+          echo "=== 确认调度器（应为 SLIM_SCHED + SCHED_CLASS_EXT）==="
+          grep -nE "SLIM_SCHED|SCHED_CLASS_EXT|HMBIRD" common/arch/arm64/configs/gki_defconfig
+          echo "=== 确认没有 hmbird 目录 ==="
+          ls common/kernel/sched/ | grep -i hmbird || echo "  hmbird: 不存在（正确）"
+          rm -f common/android/abi_gki_protected_exports_*
+          sed -i 's/ -dirty//g' common/scripts/setlocalversion
+
+      - name: 配置内核
+        run: |
+          cd common
+          echo '# CONFIG_LOCALVERSION_AUTO is not set' >> arch/arm64/configs/gki_defconfig
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-Wno-error gki_defconfig
+          echo "=== 关键配置核对 ==="
+          grep -E "CONFIG_LOCALVERSION|CONFIG_HMBIRD|CONFIG_SLIM_SCHED|CONFIG_SCHED_CLASS_EXT|CONFIG_KSU|CONFIG_MODVERSIONS|CONFIG_TRIM_UNUSED" out/.config || true
+
+      - name: 编译 Image
+        run: |
+          cd common
+          time make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-Wno-error Image
+          ls -l out/arch/arm64/boot/Image
+          echo "=== 内核版本串 ==="
+          strings out/arch/arm64/boot/Image | grep -m2 "Linux version"
+
+      - name: 打包 AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/cctv18/AnyKernel3 ak3
+          cp common/out/arch/arm64/boot/Image ak3/Image
+          cd ak3
+          sed -i 's/^BLOCK=.*/BLOCK=boot/' anykernel.sh
+          sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=Ace5Pro OKI 6.6.66 (official source)/' anykernel.sh
+          echo "=== anykernel.sh 关键行 ==="
+          grep -E "^BLOCK=|^IS_SLOT_DEVICE=|^kernel.string=" anykernel.sh
+          rm -rf .git
+          zip -r9 ../AK3_Ace5Pro_OKI_6.6.66.zip . > /dev/null
+          cd ..
+          ls -lh AK3_Ace5Pro_OKI_6.6.66.zip
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ace5Pro-OKI-6.6.66
+          compression-level: 9
+          path: |
+            common/out/arch/arm64/boot/Image
+            AK3_Ace5Pro_OKI_6.6.66.zip
