@@ -2,8 +2,15 @@ name: Build Ace5Pro OKI Kernel 6.6.66
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
+    inputs:
+      enable_droidspaces:
+        description: '启用 Droidspaces 支持 (含 kABI 补丁)'
+        type: boolean
+        default: true
+      enable_adios:
+        description: '启用 ADIOS IO 调度器'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -26,7 +33,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             bc bison flex libssl-dev libelf-dev python3 cpio dwarves \
-            zip unzip curl git
+            zip unzip curl git patch
 
       - name: 下载 AOSP Clang r510928 (x86_64)
         run: |
@@ -46,12 +53,88 @@ jobs:
             https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750 common
           echo "=== 确认内核版本 ==="
           head -5 common/Makefile
-          echo "=== 确认调度器（应为 SLIM_SCHED + SCHED_CLASS_EXT）==="
+          echo "=== 确认调度器（应为 SLIM_SCHED + SCHED_CLASS_EXT，不应有 HMBIRD）==="
           grep -nE "SLIM_SCHED|SCHED_CLASS_EXT|HMBIRD" common/arch/arm64/configs/gki_defconfig
           echo "=== 确认没有 hmbird 目录 ==="
           ls common/kernel/sched/ | grep -i hmbird || echo "  hmbird: 不存在（正确）"
           rm -f common/android/abi_gki_protected_exports_*
           sed -i 's/ -dirty//g' common/scripts/setlocalversion
+
+      # ─────────────────────────────────────────────────────────
+      # Droidspaces 支持
+      # GKI 内核开启 SYSVIPC/IPC_NS/POSIX_MQUEUE 会移动 task_struct 布局，
+      # 导致厂商模块 CRC 不匹配而 bootloop。必须先打 kABI 补丁，
+      # 把字段挪进 ANDROID_KABI_RESERVE 预留的 padding 里。
+      # ─────────────────────────────────────────────────────────
+      - name: '[Droidspaces] 打 kABI 补丁 (SYSVIPC padding)'
+        if: inputs.enable_droidspaces
+        run: |
+          cd common
+          echo "=== 打补丁前，确认目标上下文存在 ==="
+          grep -n -A3 "ifdef CONFIG_SYSVIPC" include/linux/sched.h | head -8
+          grep -n "ANDROID_KABI_RESERVE(6)" include/linux/sched.h || true
+
+          curl -sSL --retry 3 -o /tmp/sysvipc_kabi.patch \
+            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+          echo "补丁大小: $(wc -c < /tmp/sysvipc_kabi.patch) 字节"
+
+          echo "=== 应用 kABI 补丁 ==="
+          patch -p1 --dry-run < /tmp/sysvipc_kabi.patch
+          patch -p1 < /tmp/sysvipc_kabi.patch
+
+          echo "=== 补丁后核对 ==="
+          grep -n -A6 "CONFIG_SYSVIPC" include/linux/sched.h | head -20
+          grep -n "ANDROID_KABI_USE(6" include/linux/sched.h
+
+      - name: '[Droidspaces] 开启所需配置项'
+        if: inputs.enable_droidspaces
+        run: |
+          cd common
+          D=arch/arm64/configs/gki_defconfig
+          # 必需项（官方文档 GKI 清单）
+          for c in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS \
+                   NETFILTER_XT_MATCH_ADDRTYPE USER_NS \
+                   IP6_NF_NAT IP6_NF_TARGET_MASQUERADE MACVLAN \
+                   NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG \
+                   NETFILTER_XT_MATCH_RECENT \
+                   IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
+                   TMPFS_POSIX_ACL TMPFS_XATTR; do
+            if grep -qE "^CONFIG_${c}=y" "$D"; then
+              echo "  已开: $c"
+            elif grep -qE "^# CONFIG_${c} is not set" "$D"; then
+              sed -i "s|^# CONFIG_${c} is not set|CONFIG_${c}=y|" "$D"
+              echo "  改为 y: $c"
+            else
+              echo "CONFIG_${c}=y" >> "$D"
+              echo "  追加: $c"
+            fi
+          done
+          echo "=== 确认写入结果 ==="
+          grep -nE "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|USER_NS|MACVLAN|IP_SET)=" "$D"
+
+      # ─────────────────────────────────────────────────────────
+      # ADIOS IO 调度器（官方源码不含，需打补丁）
+      # ─────────────────────────────────────────────────────────
+      - name: '[ADIOS] 打补丁并设为默认调度器'
+        if: inputs.enable_adios
+        run: |
+          cd common
+          curl -sSL --retry 3 -o /tmp/adios.patch \
+            https://raw.githubusercontent.com/qdykernel/Build_Oneplus_Realme_Action/main/patch/adios_ioscheduler_6.6.patch
+          echo "补丁大小: $(wc -c < /tmp/adios.patch) 字节"
+
+          echo "=== 应用 ADIOS 补丁 ==="
+          patch -p1 --dry-run < /tmp/adios.patch
+          patch -p1 < /tmp/adios.patch
+
+          echo "=== 核对 ==="
+          grep -n "MQ_IOSCHED_ADIOS" block/Kconfig.iosched | head -3
+          grep -n "adios" block/Makefile
+          ls -l block/adios.c
+
+          D=arch/arm64/configs/gki_defconfig
+          echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> "$D"
+          echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y" >> "$D"
 
       - name: 配置内核
         run: |
@@ -61,7 +144,7 @@ jobs:
             CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
             KCFLAGS+=-Wno-error gki_defconfig
           echo "=== 关键配置核对 ==="
-          grep -E "CONFIG_LOCALVERSION|CONFIG_HMBIRD|CONFIG_SLIM_SCHED|CONFIG_SCHED_CLASS_EXT|CONFIG_KSU|CONFIG_MODVERSIONS|CONFIG_TRIM_UNUSED" out/.config || true
+          grep -E "CONFIG_LOCALVERSION|CONFIG_HMBIRD|CONFIG_SLIM_SCHED|CONFIG_SCHED_CLASS_EXT|CONFIG_KSU|CONFIG_MODVERSIONS|CONFIG_TRIM_UNUSED|CONFIG_SYSVIPC|CONFIG_IPC_NS|CONFIG_POSIX_MQUEUE|CONFIG_MQ_IOSCHED_ADIOS|CONFIG_MQ_IOSCHED_DEFAULT_ADIOS|CONFIG_USER_NS|CONFIG_MACVLAN|CONFIG_DEVTMPFS" out/.config || true
 
       - name: 编译 Image
         run: |
@@ -72,15 +155,17 @@ jobs:
           ls -l out/arch/arm64/boot/Image
           echo "=== 内核版本串 ==="
           strings out/arch/arm64/boot/Image | grep -m2 "Linux version"
+          echo "=== 验证 ADIOS 已编入 ==="
+          strings out/arch/arm64/boot/Image | grep -ci adios || true
 
       - name: 打包 AnyKernel3
         run: |
-          git clone --depth=1 https://github.com/cctv18/AnyKernel3 ak3
+          git clone --depth=1 -b master https://github.com/cctv18/AnyKernel3 ak3
           cp common/out/arch/arm64/boot/Image ak3/Image
           cd ak3
           sed -i 's/^BLOCK=.*/BLOCK=boot/' anykernel.sh
           sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
-          sed -i 's/^kernel.string=.*/kernel.string=Ace5Pro OKI 6.6.66 (official source)/' anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=Ace5Pro OKI 6.6.66 (official source, droidspaces+adios)/' anykernel.sh
           echo "=== anykernel.sh 关键行 ==="
           grep -E "^BLOCK=|^IS_SLOT_DEVICE=|^kernel.string=" anykernel.sh
           rm -rf .git
