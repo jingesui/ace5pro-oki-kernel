@@ -20,7 +20,7 @@ import sys
 #   AOSP/高通 4 列: <crc> <symbol> <module> <export_type>
 #   上游内核 5 列 : <crc> <module> <symbol> <file> <export_type>
 # 自动探测：某行的第 3 列若为 "vmlinux"/模块名，则是 5 列布局。
-MIN_EXPECTED_SYMBOLS = 10
+MIN_EXPECTED_SYMBOLS = 4000
 
 
 def load_symvers(path):
