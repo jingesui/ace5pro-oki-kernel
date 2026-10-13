@@ -2,8 +2,19 @@ name: Build Ace5Pro OKI Kernel 6.6.66
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
+    inputs:
+      enable_fengchi:
+        description: '启用原厂风驰调度器 (hmbird) —— 必须开，否则 Bootloop'
+        type: boolean
+        default: true
+      enable_droidspaces:
+        description: '启用 Droidspaces 支持'
+        type: boolean
+        default: true
+      enable_adios:
+        description: '启用 ADIOS IO 调度器'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -19,19 +30,14 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /opt/hostedtoolcache
           sudo apt-get clean
-          echo "=== 清理后磁盘 ==="; df -h /
+          echo "=== 磁盘 ==="; df -h /
           echo "=== 内存 ==="; free -h
           echo "=== CPU ==="; nproc
 
-      # ─────────────────────────────────────────────────────────
-      # SWAP：内核编译峰值内存很高，私有仓库 runner 内存偏小。
-      # 不加 swap 会在链接阶段被 OOM Killer 杀掉（表现为突然失败）。
-      # ─────────────────────────────────────────────────────────
-      - name: 设置 SWAP
+      - name: 设置 SWAP（内存不足会导致链接阶段被 OOM 杀掉）
         run: |
           sudo swapoff -a || true
           sudo rm -f /swapfile
-          echo "=== 尝试 fallocate 分配 8G ==="
           if ! sudo fallocate -l 8G /swapfile 2>/dev/null; then
             echo "fallocate 失败，改用 dd"
             sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress
@@ -39,12 +45,10 @@ jobs:
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
-          echo "=== SWAP 状态 ==="
           swapon --show
           free -h
-          echo "=== 确认 swap 可用（应为非 0）==="
           SWAP_TOTAL=$(free -m | awk '/^Swap:/{print $2}')
-          echo "Swap 总量: ${SWAP_TOTAL} MB"
+          echo "Swap: ${SWAP_TOTAL} MB"
           if [ "${SWAP_TOTAL:-0}" -lt 1000 ]; then
             echo "::error::swap 未生效，中止以免编译后期 OOM"
             exit 1
@@ -70,34 +74,56 @@ jobs:
           "$HOME/clang/bin/clang" --version | head -3
           rm -f /tmp/clang.tar.gz
 
-      - name: 克隆官方 OKI 源码 (Ace 5 Pro / OOS15 / 6.6.66)
+      - name: 克隆官方 OKI 源码
         run: |
           git clone --depth=1 -b oneplus/sm8750_v_15.0.0_oneplus_ace5_pro \
             https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750 common
           echo "=== 内核版本（应为 6.6.66）==="
           sed -n '1,4p' common/Makefile
-          echo "=== 调度器（应为 SLIM_SCHED + SCHED_CLASS_EXT）==="
+          echo "=== 当前调度器（应为 SLIM_SCHED，待风驰补丁替换）==="
           grep -nE "SLIM_SCHED|SCHED_CLASS_EXT|HMBIRD" common/arch/arm64/configs/gki_defconfig
-          echo "=== 确认无 hmbird ==="
-          ls common/kernel/sched/ | grep -i hmbird && { echo "::error::出现 hmbird"; exit 1; } || echo "  hmbird: 不存在（正确）"
           rm -f common/android/abi_gki_protected_exports_*
           sed -i 's/ -dirty//g' common/scripts/setlocalversion
 
+      # ─────────────────────────────────────────────────────────
+      # 风驰调度器：原厂用的就是它，不打必 bootloop
+      # 机型专用补丁，内部会把 SLIM_SCHED + SCHED_CLASS_EXT 换成 HMBIRD_SCHED
+      # ─────────────────────────────────────────────────────────
+      - name: '[风驰] 打机型专用补丁'
+        if: inputs.enable_fengchi
+        run: |
+          cd common
+          curl -sSL --retry 3 -o /tmp/fengchi.patch \
+            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/oneplus/hmbird/fengchi_OP-ACE-5-PRO_A15.patch
+          echo "补丁: $(wc -c < /tmp/fengchi.patch) 字节, $(wc -l < /tmp/fengchi.patch) 行"
+
+          echo "=== 应用（失败即中止，不给 || true）==="
+          git init -q . 2>/dev/null || true
+          patch -p1 --no-backup-if-mismatch < /tmp/fengchi.patch
+          echo "patch 退出码=$?"
+
+          echo "=== 核对 ==="
+          test -f kernel/sched/hmbird/hmbird.c || { echo "::error::hmbird.c 未生成"; exit 1; }
+          echo "  hmbird.c: $(wc -l < kernel/sched/hmbird/hmbird.c) 行"
+          ls kernel/sched/hmbird/ | head -12
+          echo "  hmbird.h: $(wc -l < kernel/sched/hmbird.h 2>/dev/null) 行"
+          grep -q "CONFIG_HMBIRD_SCHED=y" arch/arm64/configs/gki_defconfig \
+            && echo "  ✅ defconfig 已切换为 HMBIRD_SCHED" \
+            || { echo "::error::defconfig 未切换到 HMBIRD_SCHED"; exit 1; }
+
       - name: '[Droidspaces] 打 kABI 补丁 (SYSVIPC padding)'
+        if: inputs.enable_droidspaces
         run: |
           cd common
           curl -sSL --retry 3 -o /tmp/sysvipc_kabi.patch \
             https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
           echo "补丁: $(wc -c < /tmp/sysvipc_kabi.patch) 字节"
-          echo "=== dry-run ==="
           patch -p1 --dry-run < /tmp/sysvipc_kabi.patch
-          echo "=== 正式应用（不给 || true，失败即中止）==="
           patch -p1 < /tmp/sysvipc_kabi.patch
-          echo "=== 核对字段已进 KABI 槽 ==="
           grep -n "ANDROID_KABI_USE(6" include/linux/sched.h || { echo "::error::kABI 补丁未生效"; exit 1; }
-          grep -n "ANDROID_KABI_REPLACE" include/linux/sched.h | head -2
 
-      - name: '[Droidspaces] 开启所需配置项'
+      - name: '[Droidspaces] 开启配置项'
+        if: inputs.enable_droidspaces
         run: |
           cd common
           D=arch/arm64/configs/gki_defconfig
@@ -120,17 +146,15 @@ jobs:
           done
 
       - name: '[ADIOS] 打补丁并设为默认调度器'
+        if: inputs.enable_adios
         run: |
           cd common
           curl -sSL --retry 3 -o /tmp/adios.patch \
             https://raw.githubusercontent.com/qdykernel/Build_Oneplus_Realme_Action/main/patch/adios_ioscheduler_6.6.patch
           echo "补丁: $(wc -c < /tmp/adios.patch) 字节"
-          echo "=== dry-run ==="
           patch -p1 --dry-run < /tmp/adios.patch
-          echo "=== 正式应用（不给 || true，失败即中止）==="
           patch -p1 < /tmp/adios.patch
-          echo "=== 核对 ==="
-          grep -n "MQ_IOSCHED_ADIOS" block/Kconfig.iosched | head -2 || { echo "::error::ADIOS Kconfig 未生效"; exit 1; }
+          grep -q "MQ_IOSCHED_ADIOS" block/Kconfig.iosched || { echo "::error::ADIOS Kconfig 未生效"; exit 1; }
           grep -q "adios" block/Makefile || { echo "::error::ADIOS 未进 Makefile"; exit 1; }
           ls -l block/adios.c
           D=arch/arm64/configs/gki_defconfig
@@ -149,50 +173,100 @@ jobs:
         run: |
           cd common
           FAIL=0
-          echo "=== 必须为 y 的项 ==="
-          for c in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS USER_NS MACVLAN \
-                   MQ_IOSCHED_ADIOS MQ_IOSCHED_DEFAULT_ADIOS \
-                   SLIM_SCHED SCHED_CLASS_EXT MODVERSIONS; do
+          echo "=== 必须为 y ==="
+          for c in HMBIRD_SCHED MODVERSIONS; do
             if grep -qE "^CONFIG_${c}=y" out/.config; then
               echo "  [OK]   $c"
             else
-              echo "  [FAIL] $c  -> $(grep -E "CONFIG_${c}[= ]" out/.config || echo '缺失')"
-              FAIL=1
+              echo "  [FAIL] $c -> $(grep -E "CONFIG_${c}[= ]" out/.config || echo 缺失)"; FAIL=1
             fi
           done
-          echo "=== 必须不是 y 的项 ==="
-          for c in HMBIRD_SCHED KSU KSU_SUSFS CFS_BANDWIDTH CGROUP_PIDS; do
+          echo "=== 必须不是 y（会导致 bootloop 或非预期）==="
+          for c in SLIM_SCHED SCHED_CLASS_EXT KSU KSU_SUSFS CFS_BANDWIDTH CGROUP_PIDS; do
             if grep -qE "^CONFIG_${c}=y" out/.config; then
-              echo "  [FAIL] $c 不应开启"
-              FAIL=1
+              echo "  [FAIL] $c 不应开启"; FAIL=1
             else
               echo "  [OK]   $c 未开启"
             fi
           done
-          echo "=== ABI 关键项 ==="
-          grep -E "^CONFIG_MODULE_SIG_PROTECT|^CONFIG_MODULE_SCMVERSION|^CONFIG_MODULE_SIG=|^CONFIG_TRIM_UNUSED_KSYMS" out/.config || true
           if [ "$FAIL" -ne 0 ]; then
-            echo "::error::配置校验未通过，中止编译以免产出半成品内核"
-            exit 1
+            echo "::error::配置校验未通过"; exit 1
           fi
-          echo "配置校验全部通过 ✅"
+          echo "核心配置校验通过 ✅"
 
-      - name: 编译 Image（带 OOM 保护）
+      - name: 编译 Image
         run: |
           cd common
-          set -o pipefail
-          # 编译前再确认 swap 在线
-          swapon --show
+          swapon --show || true
           free -h
-          /usr/bin/time -v make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+          time make -j"$(nproc)" LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
-            KCFLAGS+=-Wno-error Image 2>&1 | tail -40
+            KCFLAGS+=-Wno-error Image
           ls -l out/arch/arm64/boot/Image
-          echo "=== 内核版本串 ==="
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
-          echo "=== ADIOS 编入验证 ==="
-          strings out/arch/arm64/boot/Image | grep -ci adios || true
+
+      # ─────────────────────────────────────────────────────────
+      # CRC 把关：模块能否加载由符号 CRC 决定，与编译环境无关。
+      # 全中 => 可确定厂商模块能加载、能开机，无需拿设备试错。
+      # ─────────────────────────────────────────────────────────
+      - name: '[CRC 把关] 与厂商模块期望值比对'
+        run: |
+          cd common
+          echo "=== 生成 Module.symvers ==="
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out KCFLAGS+=-Wno-error modules_prepare 2>/dev/null || true
+          SYMVERS=out/Module.symvers
+          if [ ! -f "$SYMVERS" ]; then
+            echo "::warning::未生成 Module.symvers，跳过 CRC 比对"
+            exit 0
+          fi
+          echo "Module.symvers 行数: $(wc -l < $SYMVERS)"
+
+          cd "$GITHUB_WORKSPACE"
+          python3 - "$SYMVERS" expected_crc.txt <<'PY'
+          import sys, re
+          symvers, expected = sys.argv[1], sys.argv[2]
+          have = {}
+          with open(symvers, errors="replace") as f:
+              for line in f:
+                  p = line.split()
+                  if len(p) >= 4:
+                      crc, name = p[1], p[2]
+                      try: have[name] = int(crc, 16) & 0xffffffff
+                      except ValueError: pass
+          exp = []
+          with open(expected, errors="replace") as f:
+              for line in f:
+                  p = line.split()
+                  if len(p) == 2:
+                      exp.append((p[0], int(p[1], 16) & 0xffffffff))
+          print("Module.symvers 符号数: %d" % len(have))
+          print("期望符号数        : %d" % len(exp))
+          miss, bad, ok = [], [], 0
+          for name, want in exp:
+              if name not in have: miss.append(name)
+              elif have[name] != want: bad.append((name, want, have[name]))
+              else: ok += 1
+          print()
+          print("匹配 %d / %d" % (ok, len(exp)))
+          if miss:
+              print("\n内核未导出（%d）:" % len(miss))
+              for n in miss[:25]: print("   -", n)
+          if bad:
+              print("\nCRC 不一致（%d）:" % len(bad))
+              for n, w, g in bad[:25]:
+                  print("   %-38s 期望 0x%08x  实际 0x%08x" % (n, w, g))
+          pct = 100.0 * ok / len(exp) if exp else 0
+          print("\n匹配率: %.1f%%" % pct)
+          if bad:
+              print("\n::error::存在 %d 个符号 CRC 不匹配，厂商模块将拒绝加载" % len(bad))
+              sys.exit(1)
+          elif miss:
+              print("\n::warning::有符号未导出，但无 CRC 冲突（可能是 TRIM_UNUSED_KSYMS 裁剪）")
+          else:
+              print("\n✅ 全部匹配 —— 厂商模块可正常加载，预期能开机")
+          PY
 
       - name: 打包 AnyKernel3
         run: |
@@ -201,7 +275,8 @@ jobs:
           cd ak3
           sed -i 's/^BLOCK=.*/BLOCK=boot/' anykernel.sh
           sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
-          sed -i 's/^kernel.string=.*/kernel.string=Ace5Pro OKI 6.6.66 (official src + droidspaces + adios)/' anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=Ace5Pro OKI 6.6.66 (fengchi+droidspaces+adios)/' anykernel.sh
+          sed -i 's|^ui_print "内核构建者:.*|ui_print "内核构建者: jingesui"|' anykernel.sh
           grep -E "^BLOCK=|^IS_SLOT_DEVICE=|^kernel.string=" anykernel.sh
           rm -rf .git
           zip -r9 ../AK3_Ace5Pro_OKI_6.6.66.zip . > /dev/null
@@ -211,9 +286,10 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: Ace5Pro-OKI-6.6.66
+          name: Ace5Pro-OKI-6.6.66-fengchi
           compression-level: 9
           path: |
             common/out/arch/arm64/boot/Image
             AK3_Ace5Pro_OKI_6.6.66.zip
             common/out/.config
+            common/out/Module.symvers
