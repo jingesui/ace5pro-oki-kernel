@@ -1,59 +1,212 @@
-# 一加 Ace 5 Pro (PKR110) 官方 OKI 内核 6.6.66
-
-云编译：官方源码 + **原厂风驰调度器 (hmbird)** + Droidspaces + ADIOS IO 调度器。
-
-## 为什么必须用风驰（关键教训）
-
-用 root 从原厂内核取出的 `/proc/config.gz`（7743 行）显示：
-
-```
-CONFIG_HMBIRD_SCHED=y     ← 原厂就是风驰
-CONFIG_SLIM_SCHED   不存在
-```
-
-而 OnePlusOSS 开源分支出厂的 `gki_defconfig` 里写的是 `CONFIG_SLIM_SCHED=y` + `CONFIG_SCHED_CLASS_EXT=y`。
-
-**开源树跟实际烧进手机的树不是同一棵** —— 开源分支不含风驰。照开源 defconfig 编，
-调度器不同 → `task_struct` 布局不同 → `genksyms` 算出的符号 CRC 全变 →
-405 个厂商模块（6.6.89 编的，带 modversions）拒绝加载 → **卡第一屏 bootloop**。
-
-| | 原厂 | Gold_bug 等旧包 | 照开源 defconfig 编 |
-|---|---|---|---|
-| 调度器 | `HMBIRD_SCHED` ✅ | `HMBIRD_SCHED` ✅ | `SLIM_SCHED` ❌ |
-| 结果 | 正常 | 正常（靠改 `check_version` 放行） | **bootloop** |
-
-`TRIM_UNUSED_KSYMS` 一项原厂为 `y`、Gold_bug 为 `n`，两者都能开机，**说明它不是决定因素**。
-
-## 构建内容
-
-| 组件 | 来源 | 说明 |
-|---|---|---|
-| 内核源码 | [OnePlusOSS/android_kernel_common_oneplus_sm8750](https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750) | 分支 `oneplus/sm8750_v_15.0.0_oneplus_ace5_pro`，实测 6.6.66 |
-| 风驰调度器 | [WildKernels/kernel_patches](https://github.com/WildKernels/kernel_patches) | `oneplus/hmbird/fengchi_OP-ACE-5-PRO_A15.patch`，机型专用 |
-| Droidspaces | [ravindu644/Droidspaces-OSS](https://github.com/ravindu644/Droidspaces-OSS) | kABI 补丁（SYSVIPC 挪进 ABI padding）+ 19 项配置 |
-| ADIOS | [qdykernel](https://github.com/qdykernel/Build_Oneplus_Realme_Action) | `adios_ioscheduler_6.6.patch`，设为默认调度器 |
-
-**不内置 KernelSU**（走修补 init_boot），**不改 CRC 校验**（保持官方 `return 0`）。
-
-## CRC 把关
-
-编译后用 `Module.symvers` 与厂商模块期望的 **207 个符号 CRC** 逐一比对
-（`expected_crc.txt`，从 `oplus_bsp_midas` / `oplus_bsp_sched_ext` /
-`oplus_power_hook` / `wlan_firmware_service` 四个模块的 `__versions` 段解析而来）。
-
-CRC 由源码+配置决定，与编译环境无关 —— **全中即可确定模块能加载、能开机**，
-不需要拿设备试错。不中会打印出具体哪个符号不匹配。
-
-## 刷入
-
-```bash
-fastboot flash boot AK3_Ace5Pro_OKI_6.6.66.zip
-```
-
-刷前务必备份：`su -c "dd if=/dev/block/by-name/boot of=/sdcard/boot_backup.img"`
-
-## 已知前提
-
-- Droidspaces 的 `--cpus` / `--pids-limit` 不可用（`CFS_BANDWIDTH` / `CGROUP_PIDS`
-  会破坏 kABI 且无补丁可解，开了必 bootloop）。其余功能正常。
-- 本仓库为公开仓库 → Actions 免费且额度不限。
+# 一加 Ace 5 Pro (PKR110) 厂商模块期望的符号 CRC
+# 来源: /vendor/lib/modules/*.ko 的 __versions 段（原厂 6.6.66 内核）
+# 覆盖: oplus_bsp_midas(59) + oplus_bsp_sched_ext(146) + oplus_power_hook(36) + wlan_firmware_service(4)
+# 格式: <符号名> <crc>
+# 判据: CRC 冲突=0 才能保证模块加载（未导出符号不会拒绝加载）
+__arch_copy_from_user 0x2be0c009
+__arch_copy_to_user 0x9a85eebb
+__check_object_size 0x88db9f48
+__cpu_active_mask 0x15db3b99
+__cpu_online_mask 0xac594e02
+__cpu_possible_mask 0xde7ece30
+__cpufreq_driver_target 0x9e495a52
+__kthread_init_worker 0x561aebf5
+__list_add_valid_or_report 0x7e19152a
+__list_del_entry_valid_or_report 0x9a835040
+__msecs_to_jiffies 0x7f02188f
+__mutex_init 0xa571f6b0
+__per_cpu_offset 0x280f9f14
+__platform_driver_register 0x279498f1
+__rcu_read_lock 0x8d522714
+__rcu_read_unlock 0x2469810f
+__stack_chk_fail 0xf0fdf6cb
+__sw_hweight64 0x9f46ced8
+__trace_bprintk 0xa20d01ba
+__trace_puts 0x2d41e6f5
+__trace_trigger_soft_disabled 0xd60ef8e6
+__tracepoint_android_rvh_sched_rebalance_domains 0xadf3b1d1
+__tracepoint_android_vh_binder_del_ref 0x44d01f9b
+__tracepoint_android_vh_binder_new_ref 0xbc01f10b
+__tracepoint_android_vh_binder_proc_transaction 0x0b01d419
+__tracepoint_android_vh_cpufreq_acct_update_power 0x82c5bde0
+__tracepoint_android_vh_tick_nohz_idle_stop_tick 0x9dcb3dd8
+__tracepoint_sched_stat_runtime 0x921c1bd2
+__tracepoint_sched_switch 0xdfe3cd88
+__warn_printk 0x56470118
+_printk 0x92997ed8
+_printk_deferred 0x1e19eb6c
+_raw_read_lock 0xfe8c61f0
+_raw_read_unlock 0xdd4d55b6
+_raw_spin_lock 0xba8fbd64
+_raw_spin_lock_bh 0x0c3690fc
+_raw_spin_lock_irqsave 0x34db050b
+_raw_spin_unlock 0xb5b54b34
+_raw_spin_unlock_bh 0xe46021ca
+_raw_spin_unlock_irqrestore 0xd35cce70
+activate_task 0xe0d71e20
+alloc_chrdev_region 0xe3ec2f2b
+alloc_workqueue 0x49cd25ed
+alt_cb_patch_nops 0xa65c6def
+android_rvh_probe_register 0xc046d25b
+available_idle_cpu 0x2088e082
+balance_push_callback 0x26a9e025
+bpf_trace_run2 0x796741f7
+bpf_trace_run4 0x2741938c
+bpf_trace_run5 0x0d7d55b6
+bpf_trace_run6 0xea6ba00b
+bpf_trace_run8 0x17995035
+cdev_add 0xe0da49dc
+cdev_del 0x58491dc1
+cdev_init 0x9089cd36
+class_create 0x126112c8
+class_destroy 0xa9bff1c6
+cpu_number 0xf8b9acd3
+cpu_scale 0x54552241
+cpu_topology 0xe4bc4b09
+cpufreq_cpu_get 0x72c90142
+cpufreq_cpu_get_raw 0xb97fcefe
+cpufreq_disable_fast_switch 0x077fc653
+cpufreq_driver_fast_switch 0x59ee7839
+cpufreq_driver_resolve_freq 0xf3f14d1b
+cpufreq_enable_fast_switch 0x57e786b0
+cpufreq_register_governor 0xd1ab2478
+cpufreq_unregister_governor 0x6d756697
+cpupri_find_fitness 0x6c1bd1ba
+css_next_descendant_pre 0xb9b5ee7e
+deactivate_task 0xc2275ae4
+default_llseek 0x186ee401
+device_create 0xbeca914b
+device_destroy 0x26824530
+double_rq_lock 0x8ebf2c86
+find_task_by_vpid 0xea3513e1
+for_each_kernel_tracepoint 0x10a09bd4
+fortify_panic 0xcbd4898c
+g_opt_enable 0x3f00a121
+g_sched_enable 0x00235bfc
+get_governor_parent_kobj 0x556100b3
+gov_attr_set_get 0xfa5bbea6
+gov_attr_set_init 0x429c318d
+gov_attr_set_put 0x6a934bb6
+governor_sysfs_ops 0xf4540512
+have_governor_per_policy 0x47aad3b9
+hrtimer_cancel 0xbcacfac9
+hrtimer_init 0x33853d50
+init_task 0x5e840913
+irq_work_queue 0x4cc51d38
+irq_work_queue_on 0x222d76da
+irq_work_sync 0x117b4830
+jiffies 0x15ba50a6
+kasprintf 0xfb384d37
+kfree 0x037a0cba
+kmalloc_caches 0x74661383
+kmalloc_trace 0xa8541c9b
+kobject_init_and_add 0x15fd77ac
+kobject_put 0x0e5ae00d
+kobject_uevent_env 0x9a007312
+kstrdup 0x2d39b0a7
+kstrtoint 0x8c8569cb
+kstrtouint 0x3b6c41ea
+kthread_bind_mask 0xe25c2556
+kthread_cancel_work_sync 0x32ccd001
+kthread_create_on_node 0x8b146f69
+kthread_flush_worker 0xde48ab31
+kthread_queue_work 0x7fd30187
+kthread_stop 0xd2ef8b35
+kthread_worker_fn 0x955b0e2e
+ktime_get 0xb43f9365
+ktime_get_real_ts64 0x9ec6ca96
+ktime_get_with_offset 0xc4f0da12
+log_abnormal_wakeup_reason 0x6d20fc95
+memcmp 0x449ad0a7
+memcpy 0x4829a47e
+memset 0xdcb764ad
+memstart_addr 0x9688de8b
+module_layout 0x4e276f37
+mutex_lock 0xd5977bfb
+mutex_unlock 0xed55cabd
+nr_cpu_ids 0x017de3d5
+ns_to_timespec64 0x65929cae
+of_device_is_available 0xfe67dbde
+of_find_node_opts_by_path 0x7c497915
+of_find_node_with_property 0xecfb586e
+of_property_read_string 0xd2555b9d
+overflowuid 0x8b618d08
+param_ops_uint 0x460da8f5
+perf_trace_buf_alloc 0x2d2c902f
+perf_trace_run_bpf_submit 0xb35e9230
+pfn_is_map_memory 0x6da467cb
+pick_migrate_task 0x87559548
+platform_device_register 0x027b7b56
+platform_device_unregister 0xda7f5a52
+platform_driver_unregister 0xf5ab7c57
+pm_suspend_target_state 0x377bbcbc
+preempt_schedule_notrace 0xf70e4a4d
+proc_create 0xda0ee66a
+proc_dointvec 0xf94536c2
+proc_dointvec_minmax 0x2801a22f
+proc_dostring 0x520e97c4
+proc_mkdir 0x8b0dcbe9
+qmi_response_type_v01_ei 0x4cd2fe40
+queue_work_on 0x732ac580
+raw_spin_rq_lock_nested 0x4b8c4ea1
+raw_spin_rq_unlock 0x32a34ea8
+rb_erase 0x4d9b652b
+rb_insert_color 0xa5526619
+rb_next 0xca9360b5
+register_kprobe 0x0472cf3b
+register_kretprobe 0xa608af5e
+register_scx_sched_gki_ops 0x79d4dbee
+register_syscore_ops 0xb9c425de
+register_sysctl_sz 0x21f93669
+remap_vmalloc_range 0x2ee0b22a
+resched_curr 0xd2e95a18
+return_address 0xb917b6d7
+root_task_group 0x5f160e8f
+runqueues 0x6e40dfd2
+sched_clock 0xe94986d6
+sched_feat_keys 0xef80ba0e
+sched_ravg_window 0x75071d3a
+sched_setattr_nocheck 0x03358959
+sched_setscheduler_nocheck 0x99e45d92
+scnprintf 0x96848186
+seq_printf 0x52f30ff5
+seq_read 0xace43a6c
+seq_release 0xc8b58206
+set_next_entity 0xd83b29c9
+set_task_cpu 0x55091bd2
+single_open 0x02c47934
+snprintf 0x656e4a6e
+sprintf 0x3c3ff9fd
+sscanf 0xbcab6ee6
+stop_machine 0xdfc04014
+strcmp 0xe2d5255a
+strlen 0x98cf60b3
+strncmp 0x5a921311
+strncpy 0x9166fada
+strnlen 0xa916b694
+strsep 0x85df9b6c
+synchronize_rcu 0x6091797f
+sysctl_vals 0xc8827b75
+system_cpucaps 0x2939a88e
+tasklist_lock 0x673472ea
+trace_event_buffer_commit 0x2a1f1757
+trace_event_buffer_reserve 0x7adce031
+trace_event_printf 0x1e64c7b6
+trace_event_raw_init 0xf5caeb1b
+trace_event_reg 0x4a2edd71
+trace_handle_return 0x7381287f
+trace_raw_output_prep 0xe3e03e34
+tracepoint_probe_register 0x805e2dd2
+tracepoint_probe_unregister 0x7aba1ef6
+uclamp_eff_value 0xe355c9a3
+unregister_chrdev_region 0x6091b333
+unregister_kprobe 0xeb78b1ed
+unregister_kretprobe 0x5ff55291
+update_rq_clock 0xeb0fe8d4
+usleep_range_state 0xc3055d20
+vfree 0x999e8297
+vmalloc 0xd6ee688f
+vmalloc_user 0x5635a60a
+wake_up_process 0xa9b03a93
+walt_rq 0xda944f6d
+waltgov_cb_data 0xe4663148
