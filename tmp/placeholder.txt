@@ -1,0 +1,4 @@
+      - name: 取出仓库脚本（crc_gate.py 等）
+        uses: actions/checkout@v4
+        with:
+          path: repo
