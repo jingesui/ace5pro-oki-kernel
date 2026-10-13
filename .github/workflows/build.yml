@@ -165,10 +165,23 @@ jobs:
       - name: 生成配置
         run: |
           cd common
+          # 版本串构造（对齐原厂 6.6.66-android15-8-g<sha>-abogki<bld>-4k）：
+          #   KERNELVERSION + CONFIG_LOCALVERSION + SCM_VERSION
+          # 1) 保留官方 -4k；2) 显式提供 SCM 段；3) 阻止 setlocalversion 追加 "+"
+          SCM_VER="-android15-8-g$(echo "$GITHUB_SHA" | cut -c1-12)-abogki$(date +%Y%m%d)"
+          echo "SCM 段: ${SCM_VER}"
+          sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${SCM_VER}-4k\"|" arch/arm64/configs/gki_defconfig
+          grep -n '^CONFIG_LOCALVERSION=' arch/arm64/configs/gki_defconfig
+          # LOCALVERSION 一旦被设置，setlocalversion 就不会再追加 "+"
+          export LOCALVERSION="${SCM_VER}-4k"
+          echo "LOCALVERSION=${LOCALVERSION}" >> "$GITHUB_ENV"
           echo '# CONFIG_LOCALVERSION_AUTO is not set' >> arch/arm64/configs/gki_defconfig
           make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            LOCALVERSION="$LOCALVERSION" \
             KCFLAGS+=-Wno-error gki_defconfig
+          echo "=== 生成的版本串 ==="
+          cat out/include/config/kernel.release 2>/dev/null || echo "(待编译生成)"
 
       - name: 严格校验最终配置
         run: |
@@ -203,9 +216,18 @@ jobs:
           time make -j"$(nproc)" LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            LOCALVERSION="$LOCALVERSION" \
             KCFLAGS+=-Wno-error Image
           ls -l out/arch/arm64/boot/Image
+          echo "=== 内核版本串（应为 6.6.66-android15-8-g…-abogki…-4k）==="
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
+          VER=$(strings out/arch/arm64/boot/Image | grep -m1 -oE '6\.6\.66[A-Za-z0-9._+-]*')
+          echo "解析出版本: $VER"
+          case "$VER" in
+            *-4k+) echo "::error::版本串仍以 4k+ 结尾（setlocalversion 仍追加 +）"; exit 1 ;;
+            *abogki*-4k) echo "  ✅ 版本串格式正确" ;;
+            *) echo "::warning::版本串格式与预期不符: $VER" ;;
+          esac
 
       - name: 生成 Module.symvers
         run: |
