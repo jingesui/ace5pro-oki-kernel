@@ -1,0 +1,59 @@
+# 一加 Ace 5 Pro (PKR110) 官方 OKI 内核 6.6.66
+
+云编译：官方源码 + **原厂风驰调度器 (hmbird)** + Droidspaces + ADIOS IO 调度器。
+
+## 为什么必须用风驰（关键教训）
+
+用 root 从原厂内核取出的 `/proc/config.gz`（7743 行）显示：
+
+```
+CONFIG_HMBIRD_SCHED=y     ← 原厂就是风驰
+CONFIG_SLIM_SCHED   不存在
+```
+
+而 OnePlusOSS 开源分支出厂的 `gki_defconfig` 里写的是 `CONFIG_SLIM_SCHED=y` + `CONFIG_SCHED_CLASS_EXT=y`。
+
+**开源树跟实际烧进手机的树不是同一棵** —— 开源分支不含风驰。照开源 defconfig 编，
+调度器不同 → `task_struct` 布局不同 → `genksyms` 算出的符号 CRC 全变 →
+405 个厂商模块（6.6.89 编的，带 modversions）拒绝加载 → **卡第一屏 bootloop**。
+
+| | 原厂 | Gold_bug 等旧包 | 照开源 defconfig 编 |
+|---|---|---|---|
+| 调度器 | `HMBIRD_SCHED` ✅ | `HMBIRD_SCHED` ✅ | `SLIM_SCHED` ❌ |
+| 结果 | 正常 | 正常（靠改 `check_version` 放行） | **bootloop** |
+
+`TRIM_UNUSED_KSYMS` 一项原厂为 `y`、Gold_bug 为 `n`，两者都能开机，**说明它不是决定因素**。
+
+## 构建内容
+
+| 组件 | 来源 | 说明 |
+|---|---|---|
+| 内核源码 | [OnePlusOSS/android_kernel_common_oneplus_sm8750](https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750) | 分支 `oneplus/sm8750_v_15.0.0_oneplus_ace5_pro`，实测 6.6.66 |
+| 风驰调度器 | [WildKernels/kernel_patches](https://github.com/WildKernels/kernel_patches) | `oneplus/hmbird/fengchi_OP-ACE-5-PRO_A15.patch`，机型专用 |
+| Droidspaces | [ravindu644/Droidspaces-OSS](https://github.com/ravindu644/Droidspaces-OSS) | kABI 补丁（SYSVIPC 挪进 ABI padding）+ 19 项配置 |
+| ADIOS | [qdykernel](https://github.com/qdykernel/Build_Oneplus_Realme_Action) | `adios_ioscheduler_6.6.patch`，设为默认调度器 |
+
+**不内置 KernelSU**（走修补 init_boot），**不改 CRC 校验**（保持官方 `return 0`）。
+
+## CRC 把关
+
+编译后用 `Module.symvers` 与厂商模块期望的 **207 个符号 CRC** 逐一比对
+（`expected_crc.txt`，从 `oplus_bsp_midas` / `oplus_bsp_sched_ext` /
+`oplus_power_hook` / `wlan_firmware_service` 四个模块的 `__versions` 段解析而来）。
+
+CRC 由源码+配置决定，与编译环境无关 —— **全中即可确定模块能加载、能开机**，
+不需要拿设备试错。不中会打印出具体哪个符号不匹配。
+
+## 刷入
+
+```bash
+fastboot flash boot AK3_Ace5Pro_OKI_6.6.66.zip
+```
+
+刷前务必备份：`su -c "dd if=/dev/block/by-name/boot of=/sdcard/boot_backup.img"`
+
+## 已知前提
+
+- Droidspaces 的 `--cpus` / `--pids-limit` 不可用（`CFS_BANDWIDTH` / `CGROUP_PIDS`
+  会破坏 kABI 且无补丁可解，开了必 bootloop）。其余功能正常。
+- 本仓库为公开仓库 → Actions 免费且额度不限。
