@@ -223,14 +223,19 @@ jobs:
       # CRC 把关：模块能否加载由符号 CRC 决定，而 CRC 是源码+配置经
       # genksyms 算出的，与编译环境无关。全中即可确定能开机，无需试错。
       # ─────────────────────────────────────────────────────────
+      - name: 取出仓库脚本（crc_gate.py 等）
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
       - name: '[CRC 把关] 与厂商模块期望值比对'
         run: |
           cd common
           SYMVERS="$(pwd)/out/Module.symvers"
           test -f "$SYMVERS" || { echo "::error::无 Module.symvers"; exit 1; }
           echo "Module.symvers: $(wc -l < "$SYMVERS") 行"
-          cd "$GITHUB_WORKSPACE"
-          python3 tools/crc_gate.py "$SYMVERS" expected_crc.txt
+          test -f "$GITHUB_WORKSPACE/repo/tools/crc_gate.py" || { echo "::error::crc_gate.py 未 checkout"; exit 1; }
+          python3 "$GITHUB_WORKSPACE/repo/tools/crc_gate.py" "$SYMVERS" "$GITHUB_WORKSPACE/repo/expected_crc.txt"
 
       - name: 打包 AnyKernel3
         run: |
