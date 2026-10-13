@@ -186,10 +186,19 @@ jobs:
 
       - name: '[原厂对齐] 铺入裁剪白名单 (abi_symbollist.raw)'
         run: |
+          # 注意：本步骤在 actions/checkout 之前，$GITHUB_WORKSPACE/repo 尚不存在，
+          # 因此必须自行取回白名单文件（只取这一个文件，用 curl 而非全量 clone）
+          RAW="https://raw.githubusercontent.com/jingesui/ace5pro-oki-kernel/main/tools/abi_symbollist.raw"
+          curl -fsSL --retry 3 --max-time 60 "$RAW" -o /tmp/abi_symbollist.raw \
+            || curl -fsSL --retry 3 --max-time 60 \
+                 "https://ghproxy.net/https://raw.githubusercontent.com/jingesui/ace5pro-oki-kernel/main/tools/abi_symbollist.raw" \
+                 -o /tmp/abi_symbollist.raw
+          test -s /tmp/abi_symbollist.raw || { echo "::error::白名单下载失败"; exit 1; }
+
           cd common
           # 白名单必须位于源码树根：CONFIG_UNUSED_KSYMS_WHITELIST 是相对路径，
           # Makefile.modpost 会补 $(srctree)/ 前缀
-          cp "$GITHUB_WORKSPACE/repo/tools/abi_symbollist.raw" ./abi_symbollist.raw
+          cp /tmp/abi_symbollist.raw ./abi_symbollist.raw
           echo "白名单行数: $(wc -l < abi_symbollist.raw)"
           echo "唯一性检查: $(sort -u abi_symbollist.raw | wc -l) (应等于总行数)"
           # 关键符号抽查
