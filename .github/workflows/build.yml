@@ -162,20 +162,62 @@ jobs:
           echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> "$D"
           echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y" >> "$D"
 
+      - name: '[原厂对齐] 补齐原厂有而开源树默认缺的配置'
+        run: |
+          cd common
+          D=arch/arm64/configs/gki_defconfig
+          # 原厂 /proc/config.gz 实测有、而 gki_defconfig 默认没有的项：
+          #   CONFIG_MODULE_SCMVERSION=y      给模块打 SCM 版本戳（depends on LOCALVERSION_AUTO）
+          #   CONFIG_LOCALVERSION_AUTO=y      原厂 y；也是上一项的硬依赖
+          #   CONFIG_TRIM_UNUSED_KSYMS=y      裁剪未被引用的导出符号（原厂 y）
+          #   CONFIG_UNUSED_KSYMS_WHITELIST   裁剪白名单（原厂 "abi_symbollist.raw"）
+          #   CONFIG_HEADERS_INSTALL=y        原厂 y
+          #
+          # 白名单来源：实测本机全部 495 个厂商模块（vendor 399 + system 96）
+          # 的 __versions 段，提取出它们引用的每一个符号（共 4998 个），
+          # modpost 会把这些符号标记为 used 从而保留，确保裁剪不会伤到厂商模块。
+          echo "CONFIG_MODULE_SCMVERSION=y" >> "$D"
+          echo "CONFIG_LOCALVERSION_AUTO=y" >> "$D"
+          echo "CONFIG_HEADERS_INSTALL=y" >> "$D"
+          echo "CONFIG_TRIM_UNUSED_KSYMS=y" >> "$D"
+          echo 'CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"' >> "$D"
+          echo "=== 追加后的相关行 ==="
+          grep -nE "SCMVERSION|LOCALVERSION_AUTO|HEADERS_INSTALL|TRIM_UNUSED|UNUSED_KSYMS" "$D"
+
+      - name: '[原厂对齐] 铺入裁剪白名单 (abi_symbollist.raw)'
+        run: |
+          cd common
+          # 白名单必须位于源码树根：CONFIG_UNUSED_KSYMS_WHITELIST 是相对路径，
+          # Makefile.modpost 会补 $(srctree)/ 前缀
+          cp "$GITHUB_WORKSPACE/repo/tools/abi_symbollist.raw" ./abi_symbollist.raw
+          echo "白名单行数: $(wc -l < abi_symbollist.raw)"
+          echo "唯一性检查: $(sort -u abi_symbollist.raw | wc -l) (应等于总行数)"
+          # 关键符号抽查
+          for s in module_layout _printk kfree mutex_lock schedule; do
+            grep -qx "$s" abi_symbollist.raw && echo "  [OK] $s" || { echo "::error::白名单缺少 $s"; exit 1; }
+          done
+
       - name: 生成配置
         run: |
           cd common
           # 版本串构造（对齐原厂 6.6.66-android15-8-g<sha>-abogki<bld>-4k）：
           #   KERNELVERSION + CONFIG_LOCALVERSION + SCM_VERSION
-          # 1) 保留官方 -4k；2) 显式提供 SCM 段；3) 阻止 setlocalversion 追加 "+"
-          SCM_VER="-android15-8-g$(echo "$GITHUB_SHA" | cut -c1-12)-abogki$(date +%Y%m%d)"
-          echo "SCM 段: ${SCM_VER}"
-          sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${SCM_VER}-4k\"|" arch/arm64/configs/gki_defconfig
+          # 版本串组装（scripts/setlocalversion 第 208 行）：
+          #   KERNELVERSION + file_localversion + config_localversion + LOCALVERSION + scm_version
+          #
+          # 注意：本轮开启了 CONFIG_LOCALVERSION_AUTO=y（MODULE_SCMVERSION 的硬依赖），
+          # 因此 setlocalversion 会走 scm_version() 全量分支并向版本串追加 "-g<sha12>"。
+          # 为避免重复 SCM 段，CONFIG_LOCALVERSION 里只保留官方的 "-4k"，
+          # 由 setlocalversion 自己补 -g<sha>，最终形如：
+          #   6.6.66-4k-g<sha12>[-dirty]
+          # 这与原厂 6.6.66-android15-8-g<sha>-abogki<bld>-4k 不完全一致
+          # （原厂串由 kleaf 注入，make 体系无法复现），但保证可追溯且无重复段。
           grep -n '^CONFIG_LOCALVERSION=' arch/arm64/configs/gki_defconfig
-          # LOCALVERSION 一旦被设置，setlocalversion 就不会再追加 "+"
-          export LOCALVERSION="${SCM_VER}-4k"
-          echo "LOCALVERSION=${LOCALVERSION}" >> "$GITHUB_ENV"
-          echo '# CONFIG_LOCALVERSION_AUTO is not set' >> arch/arm64/configs/gki_defconfig
+          # 清空 LOCALVERSION，避免与 scm_version 叠加
+          export LOCALVERSION=""
+          echo "LOCALVERSION=" >> "$GITHUB_ENV"
+          # 显式确保 AUTO=y 作为末行（前面的 kconfig 追加可能被后续覆盖）
+          echo "CONFIG_LOCALVERSION_AUTO=y" >> arch/arm64/configs/gki_defconfig
           make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
             LOCALVERSION="$LOCALVERSION" \
@@ -188,7 +230,7 @@ jobs:
           cd common
           FAIL=0
           echo "=== 必须为 y（对齐原厂）==="
-          for c in HMBIRD_SCHED MODVERSIONS; do
+          for c in HMBIRD_SCHED MODVERSIONS MODULE_SCMVERSION; do
             if grep -qE "^CONFIG_${c}=y" out/.config; then
               echo "  [OK]   $c"
             else
@@ -224,9 +266,9 @@ jobs:
           VER=$(strings out/arch/arm64/boot/Image | grep -m1 -oE '6\.6\.66[A-Za-z0-9._+-]*')
           echo "解析出版本: $VER"
           case "$VER" in
-            *-4k+) echo "::error::版本串仍以 4k+ 结尾（setlocalversion 仍追加 +）"; exit 1 ;;
-            *abogki*-4k) echo "  ✅ 版本串格式正确" ;;
-            *) echo "::warning::版本串格式与预期不符: $VER" ;;
+            *4k+*)   echo "::error::版本串含 4k+（LOCALVERSION 未清空或 AUTO 未生效）"; exit 1 ;;
+            *-4k-g*) echo "  ✅ 版本串格式正确（-4k-g<sha>，LOCALVERSION_AUTO 生效）" ;;
+            *)       echo "::warning::版本串格式与预期不符: $VER（不中止，仅供参考）" ;;
           esac
 
       - name: 生成 Module.symvers
@@ -241,14 +283,64 @@ jobs:
             ls -l out/Module.symvers
           fi
 
-      # ─────────────────────────────────────────────────────────
-      # CRC 把关：模块能否加载由符号 CRC 决定，而 CRC 是源码+配置经
-      # genksyms 算出的，与编译环境无关。全中即可确定能开机，无需试错。
-      # ─────────────────────────────────────────────────────────
       - name: 取出仓库脚本（crc_gate.py 等）
         uses: actions/checkout@v4
         with:
           path: repo
+
+      # ─────────────────────────────────────────────────────────
+      # TRIM 反查：CONFIG_TRIM_UNUSED_KSYMS=y 会把"未被引用的导出符号"
+      # 从 ksymtab 中裁掉。白名单来自实测的 495 个厂商模块引用集合，
+      # 理论上是完备的；本步在编译后逐个反查，确认没有被误裁。
+      # 这是本配置唯一的 fail-fast 保护：一旦裁错，模块拒绝加载 → bootloop。
+      # ─────────────────────────────────────────────────────────
+      - name: '[TRIM 反查] 确认白名单符号未被误裁'
+        run: |
+          cd common
+          SYMVERS="$(pwd)/out/Module.symvers"
+          test -f "$SYMVERS" || { echo "::error::无 Module.symvers"; exit 1; }
+          MUST="$GITHUB_WORKSPACE/repo/tools/trim_must_keep.txt"
+          test -f "$MUST" || { echo "::error::trim_must_keep.txt 未 checkout"; exit 1; }
+
+          grep -qE '^CONFIG_TRIM_UNUSED_KSYMS=y' out/.config \
+            && echo "[确认] TRIM_UNUSED_KSYMS 已启用，执行反查" \
+            || { echo "::error::TRIM_UNUSED_KSYMS 未生效，白名单形同虚设"; exit 1; }
+          grep -qE '^CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"' out/.config \
+            || { echo "::error::UNUSED_KSYMS_WHITELIST 未生效"; exit 1; }
+
+          echo "Module.symvers 符号数: $(wc -l < "$SYMVERS")"
+          echo "必须保留清单:          $(wc -l < "$MUST")"
+
+          # 金丝雀：证明裁剪确实生效。
+          # 若 TRIM 静默失效，所有符号仍在 → "未误裁"检查会平凡通过（假保险）。
+          # 这两个符号在裁剪前存在、且不在白名单中，生效后必须消失。
+          CANARY_FAIL=0
+          for canary in LZ4_compress_HC HUF_readStats; do
+            if cut -f2 "$SYMVERS" | grep -qx "$canary"; then
+              echo "  [WARN] 金丝雀 $canary 仍存在 → 裁剪可能未真正生效"
+              CANARY_FAIL=1
+            else
+              echo "  [OK]   金丝雀 $canary 已被裁掉（证明 TRIM 生效）"
+            fi
+          done
+          if [ "$CANARY_FAIL" -ne 0 ]; then
+            echo "::error::TRIM 未生效，白名单保护形同虚设（编译继续但保护无效）"
+            exit 1
+          fi
+
+          MISSING=$(comm -23 <(sort -u "$MUST") <(cut -f2 "$SYMVERS" | sort -u) | wc -l)
+          echo "被误裁的符号数:        $MISSING"
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::error::$MISSING 个白名单符号被裁掉，厂商模块将加载失败"
+            comm -23 <(sort -u "$MUST") <(cut -f2 "$SYMVERS" | sort -u) | head -30
+            exit 1
+          fi
+          echo "裁剪白名单反查通过 ✅ 未伤及任何厂商模块所需符号"
+
+      # ─────────────────────────────────────────────────────────
+      # CRC 把关：模块能否加载由符号 CRC 决定，而 CRC 是源码+配置经
+      # genksyms 算出的，与编译环境无关。全中即可确定能开机，无需试错。
+      # ─────────────────────────────────────────────────────────
 
       - name: '[CRC 把关] 与厂商模块期望值比对'
         run: |
