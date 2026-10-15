@@ -244,21 +244,16 @@ jobs:
 
           echo "=== sync 后磁盘 ==="; df -h / | tail -1
           echo "=== 顶层内容 ==="; ls -la | head -20
-
-          # ── 磁盘瘦身：repo sync 后 .git 目录含大量对象，编译不需要 ──
-          # 保留工作树，清掉 git 历史对象（省 3-8 GiB）
-          echo "=== 清理 .git 对象（编译不需要，显著省空间）==="
+          # 注意：不要删各仓库的 .git！
+          # bazel 构建时会调 `repo manifest -r`，它需要读每个
+          # 仓库的 git 元数据（rev-parse HEAD）。删了 .git 会报：
+          #   GitCommandError: 'rev-parse --verify --quiet HEAD^{commit}' failed
+          #   fatal: not a git repository
+          #   ERROR: Failed to restore headers from symlinks  → 构建失败
+          # 实测磁盘余量充足（浅克隆后 .repo 仅 3.6 GB），无需疦身。
+          echo "=== 磁盘状态（保留 .git 以供 repo manifest -r 使用）==="
+          df -h / | tail -1
           du -sh .repo 2>/dev/null | sed 's/^/  .repo: /'
-          find . -maxdepth 4 -name ".git" -type d 2>/dev/null | while read g; do
-            d=$(dirname "$g")
-            sz=$(du -sm "$g" 2>/dev/null | cut -f1)
-            # 只清理 >20 MB 的，避免误伤
-            if [ "${sz:-0}" -gt 20 ]; then
-              rm -rf "$g"
-            fi
-          done
-          # .repo 必须保留（repo 工具元数据），但可清理其 project-objects 缓存
-          rm -rf .repo/project-objects 2>/dev/null || true
           echo "=== 清理后磁盘 ==="; df -h / | tail -1
 
       - name: 校验工作区完整性（缺一个就编不出可用内核）
