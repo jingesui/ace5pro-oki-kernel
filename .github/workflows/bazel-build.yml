@@ -311,6 +311,28 @@ jobs:
           fi
           echo "工作区校验通过 ✅"
 
+      - name: 打补丁 + 注入配置（风驰 HMBIRD / Droidspaces / ADIOS）
+        run: |
+          set -e
+          # ───────────────────────────────────────────────────────────────
+          # 全部逻辑放在仓库脚本 tools/ci_patch_and_config.sh 里，workflow
+          # 只负责调用 —— 避免 YAML 转义地狱。
+          # 历史教训：嵌套 heredoc 放第 0 列会让 yaml.scanner 报
+          #          ScannerError；echo 里的多余引号会导致 bash 语法错误。
+          #
+          # 补丁作用于 kernel_platform/msm-kernel（【不是】common）—— 铁证：
+          #   ① run#4 内嵌 config 有 CONFIG_PINCTRL=y，该行只在 msm-kernel
+          #      的 gki_defconfig 里
+          #   ② walt_rq 来自 kernel/sched/walt/，该目录只在 msm-kernel 里
+          # ───────────────────────────────────────────────────────────────
+          SCRIPT="$GITHUB_WORKSPACE/repo/tools/ci_patch_and_config.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error::缺少 $SCRIPT（actions/checkout 是否拉到了 tools/？）"
+            exit 1
+          fi
+          bash -n "$SCRIPT" || { echo "::error::ci_patch_and_config.sh 语法错误"; exit 1; }
+          bash "$SCRIPT" "$GITHUB_WORKSPACE/src" "$GITHUB_WORKSPACE/repo"
+
       - name: 构建内核（官方入口）
         run: |
           set -o pipefail
@@ -354,6 +376,49 @@ jobs:
           # 注意：build_with_bazel.py 会在 cwd（kernel_platform）下建 bazel-cache/
           # 并设 TEST_TMPDIR 指向它 —— 输出会落在源码树内，与 sync 的空间叠加。
           echo "=== 编译前磁盘 ==="; df -h / | tail -1
+
+          # ── 关闭 KMI 符号裁剪（--notrim）─────────────────────────────
+          # 为什么必须关（三项证据，详见 patches/ci_config_fragment.txt 末尾）：
+          #   ① 真机内嵌 config: "# CONFIG_TRIM_UNUSED_KSYMS is not set"
+          #   ② run#8 实测：白名单 4998 个符号与真机 495 模块的期望符号
+          #      【完全一致】，编译期 0 误裁、CRC 0 冲突，上机仍 bootloop
+          #      → 厂商模块还依赖未被 __versions 记录的符号（运行时经
+          #        kallsyms 查找），裁掉它们同样致命
+          #   ③ 已知能开机的参考内核内嵌 config 同样未启用 TRIM
+          #
+          # 注意 trim_nonlisted_kmi 在 msm-kernel/BUILD.bazel:153/168 被硬编码
+          # 为 True（kernel_aarch64 / kernel_aarch64_16k），所以只改 defconfig
+          # 不够，必须传 --notrim 让 kleaf 的 force_disable_trim 生效。
+          # 该 flag 已在本树注册：
+          #   bazelrc/flags.bazelrc:49
+          #     build --flag_alias=notrim=//build/kernel/kleaf/impl:force_disable_trim
+          # 且 kernel_config.bzl 的 _config_trim 在 disable 时直接 return []，
+          # 不会引入其它副作用。
+          #
+          # 同时注意 prepare_vendor.sh:255 的条件
+          #   ([[ .. ]] && [[ !$(grep -q ..) ]])   ← 缺空格，[[ !<空串> ]] 恒真
+          # 会在部分调用路径下追加 -g（= --gki-headers），而 -g 会把 common 树
+          # 的 6785 个头文件符号链接覆盖到 msm-kernel 上（含
+          # include/linux/sched.h、include/asm-generic/vmlinux.lds.h、
+          # include/linux/sched/task.h、include/uapi/linux/sched.h）
+          # → 补丁对 sched.h 的修改会被顶掉，walt_rq 的 CRC 永远修不好。
+          # run#4 的 build_opts.txt 里没有 -g（说明实际未触发）。
+          # 注意：-g/--gki-headers 是 build_with_bazel.py 的 argparse 开关
+          # （store_true，默认关），【没有】对应的 --nogki_headers 反向开关，
+          # 而且未知参数会被 parse_known_args 原样转交给 bazel 导致构建失败，
+          # 所以这里【不能】加 --nogki_headers。
+          # 改用补丁步骤里的断言自证：sched.h 必须是普通文件且内容含
+          # CONFIG_HMBIRD_SCHED / ANDROID_KABI_USE(6)（见 ci_patch_and_config.sh）。
+          export EXTRA_KBUILD_ARGS="--skip abl --notrim"
+          echo "=== EXTRA_KBUILD_ARGS=$EXTRA_KBUILD_ARGS ==="
+
+          # 再确认构建命令不会带 -g：显式告知脚本本变体走 msm-kernel 头文件。
+          if grep -q 'define_msm_la' kernel_platform/msm-kernel/"$PLATFORM".bzl 2>/dev/null; then
+            echo "=== 已确认 //msm-kernel:${PLATFORM}.bzl 含 define_msm_la（-g 不应触发）==="
+          else
+            echo "::warning::未在 msm-kernel/${PLATFORM}.bzl 找到 define_msm_la —— -g 可能被触发"
+          fi
+
           set -e
           timeout 10800 ./kernel_platform/build/android/prepare_vendor.sh \
             "$PLATFORM" "$VARIANT" < /dev/null 2>&1 | tee "$LOG" | tail -200
@@ -434,6 +499,36 @@ jobs:
           fi
           echo "产物断言通过 ✅"
 
+      - name: 产物验证（四项验收闸门，全部在 CI 内完成）
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE/src" || exit 0
+          DIST="kernel_platform/out/msm-kernel-${PLATFORM}-${VARIANT}/dist"
+          if [ ! -d "$DIST" ]; then
+            echo "::error::dist 目录不存在（构建未产出）: $DIST"
+            exit 1
+          fi
+          # 所有断言逻辑在仓库脚本里（避免 YAML 转义地狱）
+          # 注意：build_opts.txt 是判断 -g/--gki-headers 是否真的生效的铁证
+          #       （-g 会覆盖 sched.h，让 walt_rq 的 CRC 永远修不好）
+          echo "=== build_opts.txt（铁证：确认没有 -g / --gki-headers）==="
+          cat "$DIST/build_opts.txt" 2>/dev/null || echo "  [WARN] 无 build_opts.txt"
+          if grep -qE '(^| )-g$|--gki-headers' "$DIST/build_opts.txt" 2>/dev/null; then
+            echo "::error::构建带了 -g/--gki-headers —— common 头文件会覆盖 msm-kernel，补丁失效"
+            exit 1
+          fi
+          echo "  [OK] build_opts.txt 中无 -g / --gki-headers"
+          echo
+          python3 "$GITHUB_WORKSPACE/repo/tools/ci_verify.py" \
+            --dist "$DIST" \
+            --repo-root "$GITHUB_WORKSPACE/repo" \
+            --expected "$GITHUB_WORKSPACE/repo/expected_crc.txt" \
+            --crc-gate "$GITHUB_WORKSPACE/repo/tools/crc_gate.py" \
+            --allow clk_alpha_pll_regs
+          RC=$?
+          echo "=== ci_verify.py 退出码: $RC ==="
+          exit $RC
+
       - name: 收集产物
         if: always()
         run: |
@@ -467,4 +562,23 @@ jobs:
             src/kernel_platform/oplus/prebuild/*_tmp/**
           if-no-files-found: warn
           compression-level: 6
+          retention-days: 7
+
+      # ─────────────────────────────────────────────────────────────────
+      # 单独上传【小体积】复核文件（Module.symvers 约 728 KB + build_opts.txt），
+      # 便于需要时在本地复核 CRC 而【不必】下载上面 985 MB 的整包
+      # （用户明确投诉过带宽占用）。
+      # ─────────────────────────────────────────────────────────────────
+      - name: 上传关键小文件（Module.symvers 等，便于本地复核 CRC）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ace5Pro-keyfiles-${{ inputs.variant }}
+          path: |
+            src/kernel_platform/out/msm-kernel-${{ env.PLATFORM }}-${{ inputs.variant }}/dist/Module.symvers
+            src/kernel_platform/out/msm-kernel-${{ env.PLATFORM }}-${{ inputs.variant }}/dist/build_opts.txt
+            src/device/qcom/${{ env.PLATFORM }}-kernel/Module.symvers
+            src/device/qcom/${{ env.PLATFORM }}-kernel/build_opts.txt
+          if-no-files-found: warn
+          compression-level: 9
           retention-days: 7

@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI 配置片段 —— 由 tools/ci_patch_and_config.sh 调用 tools/ci_apply_config.py
+# 追加到 kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig 末尾
+#
+# 为什么追加到 gki_defconfig 而不是 arch/arm64/configs/vendor/sun_perf.config：
+#   DEFCONFIG=gki_defconfig（build.config.gki / build.config.msm.perf:4），
+#   且 build_config_fragments 对 perf 变体【提前 return】——
+#   build.config.msm.perf 里：
+#       if [ "${VARIANT}" = perf ]; then
+#           apply_defconfig_fragment .../vendor/${MSM_ARCH}_perf.config   # 被调用
+#           ...
+#           if [ "${VARIANT}" = perf ]; then return; fi
+#   实测反证（本仓库 run #4 的 dist/.../.config）：
+#       vendor/sun_perf.config 的 407 个有效条目中，只有 1 个出现在 run4 的
+#       最终 .config 里（0.2%）；而 msm-kernel 的 gki_defconfig 696 个条目里
+#       命中 695 个（99.9%）。
+#   → 该 fragment 事实上未生效，往里面写配置等于没写。
+#
+# 每一项的取值都来自「已知能开机且带风驰的内核」的内嵌 config
+#   （/home/Gold/agent/kernel_config.txt，6.6.66 / CONFIG_HMBIRD_SCHED=y /
+#     CONFIG_SYSVIPC=y / CONFIG_MQ_IOSCHED_ADIOS=y / 无 TRIM_UNUSED_KSYMS）
+#   并与真机 /proc/hmbird_sched 存在性、上游 issue #21 实测一致。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── SYSVIPC 系列（Droidspaces 必需；配 droidspaces.patch 的 kABI 槽 6/7/8）──
+# 注：droidspaces.patch 把 sysvsem/sysvshm 挪进 ANDROID_KABI_USE(6,...)，因此
+#     开 SYSVIPC 不再改变 task_struct 布局（genksyms 用 _orig 名计算 CRC）。
+CONFIG_SYSVIPC=y
+CONFIG_SYSVIPC_SYSCTL=y
+CONFIG_POSIX_MQUEUE=y
+CONFIG_POSIX_MQUEUE_SYSCTL=y
+
+# ── 命名空间（容器必需）──
+# 实测值：已知可开机参考里 IPC_NS=y / PID_NS=y，
+#         而 USER_NS / MACVLAN / NETFILTER_XT_MATCH_RECENT / NF_LOG_* 均为 not set。
+# 严格照抄参考配置 —— 多开项会改变结构体大小并引入 CRC 风险（见 CFS_BANDWIDTH 教训）。
+CONFIG_IPC_NS=y
+CONFIG_PID_NS=y
+
+# ── 文件系统 ──
+CONFIG_DEVTMPFS=y
+CONFIG_TMPFS_XATTR=y
+CONFIG_TMPFS_POSIX_ACL=y
+
+# ── ipset / netfilter（容器网络）──
+CONFIG_IP_SET=y
+CONFIG_IP_SET_MAX=65534
+
+# ── ADIOS IO 调度器（配 adios.patch 的 block/Kconfig.iosched）──
+# 两者必须同时为 y：MQ_IOSCHED_DEFAULT_ADIOS depends on MQ_IOSCHED_ADIOS=y
+CONFIG_MQ_IOSCHED_ADIOS=y
+CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 【绝对禁止】以下项会改变结构体大小且无 padding → 厂商模块 CRC 全变 → bootloop 且无解
+#   CONFIG_CFS_BANDWIDTH=y
+#   CONFIG_CGROUP_PIDS=y
+# 参考配置里这两项都是 "is not set"，本轮保持不动。
+#
+# 【TRIM_UNUSED_KSYMS】本轮不在此处设置。理由与处理方式见 ci_apply_config.py
+#   的 --trim 默认行为：通过 --notrim 把 CONFIG_TRIM_UNUSED_KSYMS 关掉。
+#   证据：真机 495 个厂商模块期望 CRC 的 4998 个符号，
+#   与 run#8 的 abi_symbollist.raw 白名单【完全一致】（4998 = 4998，交集 4998），
+#   即白名单已 100% 覆盖全部被引用符号、编译期 0 误裁、CRC 0 冲突，
+#   但 run#8 上机仍 bootloop → 说明厂商模块还依赖未被 __versions 记录的符号
+#   （模块运行时经 kallsyms 查找），裁剪它们同样致命。
+#   而真机内嵌 config 也是 "# CONFIG_TRIM_UNUSED_KSYMS is not set"。
+#   → 本轮用 --notrim 关掉全树裁剪，gki_defconfig 里【不要】写
+#     CONFIG_UNUSED_KSYMS_WHITELIST（未启用 TRIM 时它是死配置，写进去只会误导）。
+# ─────────────────────────────────────────────────────────────────────────────
