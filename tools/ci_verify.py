@@ -33,12 +33,33 @@ EXPECT_CONFIG = [
     ("CONFIG_SYSVIPC", "y"),
     ("CONFIG_MQ_IOSCHED_ADIOS", "y"),
     ("CONFIG_MQ_IOSCHED_DEFAULT_ADIOS", "y"),
+    # Droidspaces 官方 GKI 清单要求（容器能起来的最小集）
+    ("CONFIG_POSIX_MQUEUE", "y"),
+    ("CONFIG_IPC_NS", "y"),
+    ("CONFIG_PID_NS", "y"),
+    ("CONFIG_DEVTMPFS", "y"),
+    # Droidspaces 官方 GKI 清单的网络/防火墙项（NAT 出网 + UFW/Fail2ban）
+    ("CONFIG_NETFILTER_XT_MATCH_ADDRTYPE", "y"),
+    ("CONFIG_NETFILTER_XT_TARGET_LOG", "y"),
+    ("CONFIG_NETFILTER_XT_MATCH_RECENT", "y"),
+    ("CONFIG_IP_SET", "y"),
+    ("CONFIG_IP_SET_HASH_IP", "y"),
+    ("CONFIG_IP_SET_HASH_NET", "y"),
+    ("CONFIG_NETFILTER_XT_SET", "y"),
+    ("CONFIG_TMPFS_XATTR", "y"),
+    ("CONFIG_TMPFS_POSIX_ACL", "y"),
 ]
 EXPECT_ABSENT = [
     "CONFIG_SLIM_SCHED",
     "CONFIG_SCHED_CLASS_EXT",
     "CONFIG_CFS_BANDWIDTH",
     "CONFIG_CGROUP_PIDS",
+    # TRIM_UNUSED_KSYMS 必须是 not set —— 这是 run#8 的实测死因：
+    # 白名单（android/abi_gki_aarch64_qcom，2468 个符号）覆盖不到厂商模块需要的
+    # 4998 个符号，被裁的正是白名单外那 687 个；而 __versions 只记录编译期引用，
+    # 运行时经 kallsyms 查找的符号根本不进白名单 → 编译期查不出、上机 bootloop。
+    # 真机内嵌 config 也是 "# CONFIG_TRIM_UNUSED_KSYMS is not set"。
+    "CONFIG_TRIM_UNUSED_KSYMS",
 ]
 
 

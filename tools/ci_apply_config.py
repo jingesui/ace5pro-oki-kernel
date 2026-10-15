@@ -57,25 +57,39 @@ def existing_keys(lines):
 
 
 def symbol_exists_in_kconfig(kconfig_dir, name):
-    """在整个 Kconfig 树里找 'config <NAME>'。
+    """在整个 Kconfig 树里找 'config <NAME>' 或 'menuconfig <NAME>'。
 
-    找不到 = 符号名不存在（或依赖它的菜单不可见）。写进 defconfig 只会被
+    注意必须同时认 【menuconfig】 —— 例如 CONFIG_IP_SET 在本树是
+    net/netfilter/ipset/Kconfig:2 的
+        menuconfig IP_SET
+    若只匹配 'config'，会把 IP_SET 这类符号误判为"不存在"，
+    从而在 CI 里假失败（这是实测踩到过的坑）。
+
+    文件名必须用 startswith("Kconfig")，不能只判 == "Kconfig"。
+    内核里有大量 Kconfig.<suffix> 形式的文件，例如
+    block/Kconfig.iosched（MQ_IOSCHED_ADIOS 就定义在这里）、
+    kernel/Kconfig.preempt、Kconfig.ext 等。
+    实测踩过：若只判 == "Kconfig" 会漏掉 Kconfig.iosched，
+    导致 MQ_IOSCHED_ADIOS 被判为"不存在"而假失败。
+
+    找不到 = 符号名确实不存在（或依赖它的菜单不可见）。写进 defconfig 只会被
     olddefconfig 丢弃并告警，故直接跳过更干净、也避免误导。
     """
     key = name[len("CONFIG_"):]
-    pat = re.compile(r"^\s*config\s+" + re.escape(key) + r"\s*$")
+    pat = re.compile(r"^\s*(?:menu)?config\s+" + re.escape(key) + r"\s*$")
     for root, dirs, files in os.walk(kconfig_dir):
         # 跳过 .git / 输出目录，避免无谓遍历
         dirs[:] = [d for d in dirs if d not in (".git", "out", "bazel-bin", "bazel-out")]
         for fn in files:
-            if fn == "Kconfig" or fn.endswith("Kconfig"):
-                try:
-                    with open(os.path.join(root, fn), errors="replace") as f:
-                        for line in f:
-                            if pat.match(line):
-                                return True
-                except OSError:
-                    continue
+            if not fn.startswith("Kconfig"):
+                continue
+            try:
+                with open(os.path.join(root, fn), errors="replace") as f:
+                    for line in f:
+                        if pat.match(line):
+                            return True
+            except OSError:
+                continue
     return False
 
 

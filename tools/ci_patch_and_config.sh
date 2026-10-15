@@ -14,8 +14,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-SRC="${1:-$GITHUB_WORKSPACE/src}"
-REPO_ROOT="${2:-$GITHUB_WORKSPACE/repo}"
+# 路径统一转成绝对路径：脚本内部多处 cd（尤其是进入 msm-kernel 做 git apply），
+# 若入参是相对路径，cd 之后就会解析到错误位置（实测踩过：
+# `git apply repo/patches/x.patch` 报"没有那个文件或目录"）。
+# CI 里传的是 $GITHUB_WORKSPACE/... 本就是绝对路径，这里是稳健性加固。
+abspath() { (cd "$1" 2>/dev/null && pwd) || echo "$1"; }
+
+SRC="$(abspath "${1:-$GITHUB_WORKSPACE/src}")"
+REPO_ROOT="$(abspath "${2:-$GITHUB_WORKSPACE/repo}")"
 KERNEL="$SRC/kernel_platform/msm-kernel"
 
 PATCH_DIR="$REPO_ROOT/patches"
@@ -59,12 +65,22 @@ echo "  walt.h  : $PRE_WALT_H"
 # ─────────────────────────────────────────────────────────────────────────────
 banner "1. 应用补丁（顺序不可换）"
 
+APPLIED_ANY=0
 apply_one() {
   local name="$1"
   echo
   echo "--- git apply --whitespace=nowarn $name ---"
+  # 幂等处理：若补丁【已经应用过】，git apply 会失败（上下文里新旧行都对不上）。
+  # 用 `--check --reverse` 判定：反着能干净应用 = 已经应用过了 → 跳过而不报错。
+  # CI 每次都是全新 repo sync，正常不会走到这条分支；但重试/复用工作区时
+  # 没有这个判断就会假失败（实测踩过）。
+  if git -C "$KERNEL" apply --check --reverse "$PATCH_DIR/$name" >/dev/null 2>&1; then
+    echo "  [SKIP] $name 已经应用过（反向 check 通过），跳过"
+    return 0
+  fi
   if git -C "$KERNEL" apply --whitespace=nowarn -v "$PATCH_DIR/$name" 2>&1 | tee "$LOGDIR/apply_${name}.log"; then
     echo "  [OK] $name 应用成功"
+    APPLIED_ANY=1
   else
     echo "  [FAIL] $name 应用失败，输出上面日志"
     echo "  --- 失败定位（--check 明细）---"
@@ -174,7 +190,16 @@ fi
 POST_SCHED_H=$(git -C "$KERNEL" hash-object include/linux/sched.h)
 POST_WALT_H=$(git -C "$KERNEL" hash-object kernel/sched/walt/walt.h)
 echo "  sched.h blob: $PRE_SCHED_H -> $POST_SCHED_H"
-if [ "$PRE_SCHED_H" = "$POST_SCHED_H" ]; then echo "  [FAIL] include/linux/sched.h 内容未变化"; FAIL=1; fi
+if [ "$PRE_SCHED_H" = "$POST_SCHED_H" ]; then
+  if [ "$APPLIED_ANY" -eq 1 ]; then
+    # 本次真的应用了补丁，sched.h 却没变 → 补丁静默失效，必须失败
+    echo "  [FAIL] 应用了补丁但 include/linux/sched.h 内容未变化"
+    FAIL=1
+  else
+    # 全部补丁都被判为"已应用"而跳过 → sched.h 本就不该再变，属正常幂等
+    echo "  [OK]   sched.h 未变化（补丁本次全部跳过 = 之前已应用，幂等重跑正常）"
+  fi
+fi
 echo "  walt.h  blob: $PRE_WALT_H -> $POST_WALT_H"
 
 cd - >/dev/null
@@ -200,7 +225,181 @@ echo
 echo "=== 注入后 gki_defconfig 尾部 ==="
 tail -40 "$KERNEL/arch/arm64/configs/gki_defconfig"
 
-banner "4. 完成"
+# ─────────────────────────────────────────────────────────────────────────────
+banner "4. 阻止 --gki-headers（-g）覆盖补丁"
+
+# 问题根源（已逐条实测证明）：
+#   prepare_vendor.sh:253-256
+#       if ([[ "$KERNEL_VARIANT" == "consolidate" ]] || [[ "$KERNEL_VARIANT" == "perf" ]]) && \
+#           [[ !$(grep -q "define_msm_la" "${ROOT_DIR}/msm-kernel/$KERNEL_TARGET.bzl") ]]; then
+#           EXTRA_KBUILD_ARGS+=" -g"
+#       fi
+#   `[[ !$( ... ) ]]` 里 ! 与 $( 之间【缺空格】→ $(grep -q ...) 因 -q 不输出而恒为空串
+#   → `[[ !<空串> ]]` 【恒真】→ 只要变体是 perf/consolidate，-g 必被追加。
+#   我在本地用 4 种情形实证（sun.bzl 存在/不存在、含/不含 define_msm_la）：
+#   四种全部输出"→ -g 被追加"。
+#
+#   而 build_with_bazel.py 的 --gki-headers 会遍历 msm-kernel/files_gki_aarch64.txt，
+#   对每个【含 ".h" 子串】的条目做 os.remove(msm_kernel/<f>) + symlink(common/<f>)。
+#   本补丁改过的 73 个文件里有 6 个正好落在这个列表里且含 ".h"：
+#       include/asm-generic/vmlinux.lds.h
+#       include/linux/sched.h          ← HMBIRD KABI / walt 关键，被覆盖后 CRC 永远修不好
+#       include/linux/sched/task.h
+#       include/uapi/linux/sched.h
+#       kernel/bpf/bpf_struct_ops_types.h
+#       kernel/sched/sched.h
+#   另有 8 个非-.h 的补丁文件（kernel/sched/core.c、kernel/fork.c、kernel/time/tick-sched.c、
+#   kernel/sched/{build_policy,debug,idle}.c、drivers/tty/sysrq.c、init/init_task.c）
+#   会被该分支 finally 里的
+#       git checkout --pathspec-from-file=files_gki_aarch64.txt
+#   还原成基线 → 补丁改动同样被抹掉。
+#
+#   已核实：files_gki_aarch64.txt 在整个构建里【只有这两处用途】
+#   （build_with_bazel.py:309 的 symlink 循环、:339 的 finally checkout），
+#   BUILD.bazel / msm_kernel_extensions.bzl 都不引用它（实测 grep 均为 0 次）。
+#
+# 两层处置：
+#   ① 【根因】把 prepare_vendor.sh 里那个错误条件改成恒假 —— 从源头阻止 -g 加进来。
+#      这是最干净的修法：既不改变"microsoft 该有"的语义（msm-kernel 的 sun.bzl
+#      确实定义了 define_msm_la，本来就不该加 -g），也不依赖任何断言。
+#      备份为 .orig，并打印修改前后对照，便于审计。
+#   ② 【兜底】把 files_gki_aarch64.txt 替换成单一无害路径 "Makefile"
+#      （msm-kernel 根目录确有该文件、被 git 跟踪、本补丁从不修改、字符串不含 ".h"）：
+#      -g 的循环不再命中 → 不 remove/symlink；finally 的 checkout 只涉及它 → 空操作。
+#      即使 ① 因上游脚本变动而失效，② 仍能保证补丁不被覆盖或还原。
+PV="$SRC/kernel_platform/build/android/prepare_vendor.sh"
+if [ -f "$PV" ]; then
+  echo "--- ① 修复 prepare_vendor.sh 的 -g 条件（根因）---"
+  echo "  文件: $PV"
+  if grep -q 'CI-FIX: the original condition' "$PV"; then
+    echo "  [OK] 已修复过，跳过（幂等）"
+  else
+    cp "$PV" "$PV.orig"
+    python3 - "$PV" <<'PYEOF'
+import sys
+
+p = sys.argv[1]
+lines = open(p, errors='replace').read().splitlines(keepends=True)
+
+# 按行定位（比正则稳健：不依赖转义、缩进与续行符的细节）
+# 目标块共 4 行：
+#   <indent>if ([[ "$KERNEL_VARIANT" == "consolidate" ]] || [[ ... == "perf" ]]) && \
+#   <indent>    [[ !$(grep -q "define_msm_la" "${ROOT_DIR}/msm-kernel/$KERNEL_TARGET.bzl") ]]; then
+#   <indent>  EXTRA_KBUILD_ARGS+=" -g"
+#   <indent>fi
+hits = [i for i, l in enumerate(lines)
+        # 跳过注释行：幂等重跑时，原条件已被我们包进注释里，
+        # 若不排除注释，会再次命中并触发形状校验失败。
+        if not l.lstrip().startswith('#')
+        and '!$(grep -q "define_msm_la"' in l and 'KERNEL_TARGET.bzl' in l]
+if len(hits) != 1:
+    sys.stderr.write("::error::定位 -g 条件失败：命中 %d 处（期望 1）\n" % len(hits))
+    sys.exit(1)
+cond_idx = hits[0]
+if_idx = cond_idx - 1
+
+# 逐行校验形状，任何不符即拒绝修改（宁可不动也不改错）
+ok = True
+if 'if (' not in lines[if_idx] or '"perf"' not in lines[if_idx]:
+    ok = False
+if 'EXTRA_KBUILD_ARGS+=" -g"' not in lines[if_idx + 2]:
+    ok = False
+if lines[if_idx + 3].strip() != 'fi':
+    ok = False
+if not ok:
+    sys.stderr.write("::error::-g 条件块的 4 行形状与预期不符，拒绝修改：\n")
+    for i in range(if_idx, min(if_idx + 4, len(lines))):
+        sys.stderr.write("    %d: %r\n" % (i + 1, lines[i]))
+    sys.exit(1)
+
+indent = lines[if_idx][:len(lines[if_idx]) - len(lines[if_idx].lstrip())]
+comment = [
+    indent + "# CI-FIX: the original condition was\n",
+    indent + '#   if ([[ "$KERNEL_VARIANT" == "consolidate" ]] || [[ "$KERNEL_VARIANT" == "perf" ]]) && \\\n',
+    indent + '#       [[ !$(grep -q "define_msm_la" "${ROOT_DIR}/msm-kernel/$KERNEL_TARGET.bzl") ]]; then\n',
+    indent + "#\n",
+    indent + "# The inner test `[[ !<empty> ]]` has no space between ! and $(, and grep -q\n",
+    indent + "# emits nothing, so it is ALWAYS TRUE -> -g (--gki-headers) was always appended.\n",
+    indent + "# -g replaces msm-kernel headers listed in files_gki_aarch64.txt with symlinks\n",
+    indent + "# into common/, and its `finally` block git-checkouts that same list, which would\n",
+    indent + "# silently wipe our scheduler patches: include/linux/sched.h, kernel/sched/sched.h,\n",
+    indent + "# kernel/sched/core.c, kernel/fork.c, kernel/time/tick-sched.c and 4 others.\n",
+    indent + "# Disabled unconditionally: msm-kernel/sun.bzl does define define_msm_la, so -g\n",
+    indent + "# was never intended here.\n",
+    indent + "if false; then\n",
+    indent + '    EXTRA_KBUILD_ARGS+=" -g"\n',
+    indent + "fi\n",
+]
+lines[if_idx:if_idx + 4] = comment
+open(p, 'w').write(''.join(lines))
+print("  已将 -g 条件（第 %d-%d 行）替换为 `if false; then`" % (if_idx + 1, if_idx + 4))
+PYEOF
+    if [ $? -ne 0 ]; then die "修复 prepare_vendor.sh 失败"; fi
+    echo "  --- 修改后对照 ---"
+    grep -n -B2 -A3 'CI-FIX: the original condition' "$PV" | head -14
+    grep -n 'if false; then' "$PV" | head -3
+    echo "  [OK] 已从源头阻止 -g"
+  fi
+else
+  echo "  [WARN] 未找到 $PV —— 只能依赖 ② 兜底"
+fi
+
+echo
+echo "--- ② 兜底：中和 files_gki_aarch64.txt ---"
+GKI_LIST="$KERNEL/files_gki_aarch64.txt"
+if [ -f "$GKI_LIST" ]; then
+  echo "  原文: $GKI_LIST（$(wc -l < "$GKI_LIST") 行，含 .h 子串 $(grep -c '\.h' "$GKI_LIST" || true) 行）"
+  if grep -q '^Makefile$' "$GKI_LIST" && [ "$(wc -l < "$GKI_LIST")" -le 1 ]; then
+    echo "  [OK] 已中和过，跳过（幂等）"
+  else
+    cp "$GKI_LIST" "$GKI_LIST.orig"
+    # 必须整体替换为「单一无害路径」，不能只删/注释 .h 行（两种做法都错）：
+    #   ① 加注释前缀：判定是子串测试 `if ".h" in f`，
+    #      "#CI-NEUTRALIZED include/linux/sched.h" 里【依然含 ".h"】→ 仍会命中
+    #      （实测：注释方案后仍有 3604 条会被处理）
+    #   ② 只删 .h 行：剩下 8 个非-.h 的补丁文件会被 finally 的 git checkout 还原
+    # 替换为 "Makefile" 则：不含 ".h"（-g 不动作）+ 是真实被跟踪文件
+    # （finally 的 checkout 空操作且退出码 0）。
+    echo "Makefile" > "$GKI_LIST"
+    echo "  已替换为单一无害路径（原 $(wc -l < "$GKI_LIST.orig") 行 -> 1 行）"
+    if grep -q '\.h' "$GKI_LIST"; then
+      die "中和失败：清单里仍含 '.h'，-g 会覆盖补丁文件"
+    fi
+    echo "  [OK] 无 '.h' 子串 → --gki-headers 不会覆盖或删除任何文件"
+  fi
+else
+  echo "  [WARN] 未找到 $GKI_LIST"
+fi
+
+echo
+echo "=== 复核：6 个高风险 .h 文件与 8 个非-.h 文件均不受影响 ==="
+for f in include/linux/sched.h kernel/sched/sched.h kernel/sched/core.c kernel/sched/walt/walt.h \
+         include/asm-generic/vmlinux.lds.h include/uapi/linux/sched.h; do
+  printf "  %-42s %s\n" "$f" "$(git -C "$KERNEL" hash-object "$f" | cut -c1-12)"
+done
+
+# 打印反证：若没有这两层防护，-g 会覆盖/还原哪些补丁文件。
+# 用于事后审计（万一上游脚本又改回去）。
+echo
+echo "=== 反证记录：若无防护，-g 会影响的补丁文件 ==="
+if [ -f "$KERNEL/files_gki_aarch64.txt.orig" ]; then
+  for f in include/asm-generic/vmlinux.lds.h include/linux/sched.h \
+           include/linux/sched/task.h include/uapi/linux/sched.h \
+           kernel/bpf/bpf_struct_ops_types.h kernel/sched/sched.h; do
+    if grep -qxF "$f" "$KERNEL/files_gki_aarch64.txt.orig"; then
+      echo "  [原会 symlink 覆盖] $f"
+    fi
+  done
+  for f in drivers/tty/sysrq.c init/init_task.c kernel/fork.c kernel/sched/build_policy.c \
+           kernel/sched/core.c kernel/sched/debug.c kernel/sched/idle.c kernel/time/tick-sched.c; do
+    if grep -qxF "$f" "$KERNEL/files_gki_aarch64.txt.orig"; then
+      echo "  [原会 git checkout 还原] $f"
+    fi
+  done
+fi
+
+banner "5. 完成"
 echo "  补丁: 3 个已应用并通过断言"
 echo "  配置: 已注入 gki_defconfig（DEFCONFIG=gki_defconfig，perf 变体无额外 fragment）"
+echo "  防护: prepare_vendor.sh 的 -g 条件已置为恒假 + files_gki_aarch64.txt 已中和"
 echo "  下一步: 构建内核"

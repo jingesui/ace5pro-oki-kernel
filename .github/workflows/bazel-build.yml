@@ -519,6 +519,29 @@ jobs:
           fi
           echo "  [OK] build_opts.txt 中无 -g / --gki-headers"
           echo
+          # ── TRIM 硬断言（run#8 实测死因，必须显式确认未启用）──────────
+          # 白名单 android/abi_gki_aarch64_qcom 只有 2468 个符号，而厂商模块
+          # 需要 4998 个；被裁的正是白名单外那 687 个。__versions 只记录编译期
+          # 引用，运行时经 kallsyms 查找的符号根本不进白名单 → 编译期查不出、
+          # 上机 bootloop。真机内嵌 config 也是 not set。
+          echo "=== .config 的 TRIM 状态（必须未启用）==="
+          CFG_P="$GITHUB_WORKSPACE/src/device/qcom/${PLATFORM}-kernel/.config"
+          if [ ! -f "$CFG_P" ]; then
+            CFG_P="$DIST/.config"
+          fi
+          echo "  检查文件: $CFG_P"
+          if [ -f "$CFG_P" ]; then
+            grep -n 'TRIM_UNUSED_KSYMS\|UNUSED_KSYMS_WHITELIST' "$CFG_P" || echo "  (无 TRIM 相关行)"
+            if grep -q '^CONFIG_TRIM_UNUSED_KSYMS=y' "$CFG_P"; then
+              echo "::error::CONFIG_TRIM_UNUSED_KSYMS=y —— 会裁掉厂商模块运行时依赖的符号"
+              echo "::error::（run#8 实测：编译期 0 误裁 / CRC 0 冲突，上机仍 bootloop）"
+              exit 1
+            fi
+            echo "  [OK] CONFIG_TRIM_UNUSED_KSYMS 未启用（--notrim 生效）"
+          else
+            echo "  [WARN] 找不到 .config；TRIM 状态由 ci_verify.py 的内嵌 config 断言覆盖"
+          fi
+          echo
           python3 "$GITHUB_WORKSPACE/repo/tools/ci_verify.py" \
             --dist "$DIST" \
             --repo-root "$GITHUB_WORKSPACE/repo" \
@@ -579,6 +602,7 @@ jobs:
             src/kernel_platform/out/msm-kernel-${{ env.PLATFORM }}-${{ inputs.variant }}/dist/build_opts.txt
             src/device/qcom/${{ env.PLATFORM }}-kernel/Module.symvers
             src/device/qcom/${{ env.PLATFORM }}-kernel/build_opts.txt
+            src/LOGDIR/build_*.log
           if-no-files-found: warn
           compression-level: 9
           retention-days: 7

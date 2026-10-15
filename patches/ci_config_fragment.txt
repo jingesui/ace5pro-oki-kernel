@@ -3,48 +3,75 @@
 # 追加到 kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig 末尾
 #
 # 为什么追加到 gki_defconfig 而不是 arch/arm64/configs/vendor/sun_perf.config：
-#   DEFCONFIG=gki_defconfig（build.config.gki / build.config.msm.perf:4），
-#   且 build_config_fragments 对 perf 变体【提前 return】——
-#   build.config.msm.perf 里：
-#       if [ "${VARIANT}" = perf ]; then
-#           apply_defconfig_fragment .../vendor/${MSM_ARCH}_perf.config   # 被调用
-#           ...
-#           if [ "${VARIANT}" = perf ]; then return; fi
-#   实测反证（本仓库 run #4 的 dist/.../.config）：
+#   DEFCONFIG=gki_defconfig（build.config.gki / build.config.msm.perf:4）。
+#   实测反证（本仓库 run #4 的 dist 内嵌 .config）：
 #       vendor/sun_perf.config 的 407 个有效条目中，只有 1 个出现在 run4 的
 #       最终 .config 里（0.2%）；而 msm-kernel 的 gki_defconfig 696 个条目里
 #       命中 695 个（99.9%）。
 #   → 该 fragment 事实上未生效，往里面写配置等于没写。
+#   代码依据：build.config.msm.perf 的 build_defconfig_fragments() 对 perf
+#   变体提前 return。上游 Droidspaces 官方文档同样要求"Edit
+#   arch/arm64/configs/gki_defconfig in place rather than adding a fragment"。
 #
-# 每一项的取值都来自「已知能开机且带风驰的内核」的内嵌 config
-#   （/home/Gold/agent/kernel_config.txt，6.6.66 / CONFIG_HMBIRD_SCHED=y /
-#     CONFIG_SYSVIPC=y / CONFIG_MQ_IOSCHED_ADIOS=y / 无 TRIM_UNUSED_KSYMS）
-#   并与真机 /proc/hmbird_sched 存在性、上游 issue #21 实测一致。
+# 清单来源（逐项对齐，非自创）：
+#   ① 上游 Droidspaces 官方《Kernel configuration》GKI 章节的 defconfig 列表
+#      https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/Kernel-Configuration.md
+#   ② 已知能开机且带风驰的内核内嵌 config
+#      /home/Gold/agent/kernel_config.txt
+#   两项交叉一致才写入；官方标注"optional"的项按下方说明取舍。
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── SYSVIPC 系列（Droidspaces 必需；配 droidspaces.patch 的 kABI 槽 6/7/8）──
-# 注：droidspaces.patch 把 sysvsem/sysvshm 挪进 ANDROID_KABI_USE(6,...)，因此
-#     开 SYSVIPC 不再改变 task_struct 布局（genksyms 用 _orig 名计算 CRC）。
+# ── IPC（Droidspaces 必需；配 droidspaces.patch 的 kABI 槽 6/7/8）──
+# droidspaces.patch 把 sysvsem/sysvshm 挪进 ANDROID_KABI_USE(6,...) /
+# _ANDROID_KABI_REPLACE(RESERVE(7);RESERVE(8),...)，
+# 因此开 SYSVIPC 不再改变 task_struct 布局（genksyms 用 _orig 名算 CRC）。
+# 官方原文："These are not optional. Without the patch for your kernel version,
+#           enabling the IPC options bootloops the device."
 CONFIG_SYSVIPC=y
 CONFIG_SYSVIPC_SYSCTL=y
 CONFIG_POSIX_MQUEUE=y
 CONFIG_POSIX_MQUEUE_SYSCTL=y
 
-# ── 命名空间（容器必需）──
-# 实测值：已知可开机参考里 IPC_NS=y / PID_NS=y，
-#         而 USER_NS / MACVLAN / NETFILTER_XT_MATCH_RECENT / NF_LOG_* 均为 not set。
-# 严格照抄参考配置 —— 多开项会改变结构体大小并引入 CRC 风险（见 CFS_BANDWIDTH 教训）。
+# ── 命名空间（容器必需；官方："Without it, Containers cannot start."）──
 CONFIG_IPC_NS=y
 CONFIG_PID_NS=y
 
-# ── 文件系统 ──
+# ── 硬件访问（官方："Without it, Hardware access is unavailable."）──
 CONFIG_DEVTMPFS=y
-CONFIG_TMPFS_XATTR=y
-CONFIG_TMPFS_POSIX_ACL=y
 
-# ── ipset / netfilter（容器网络）──
+# ── tmpfs xattr / posix acl（官方：NixOS 支持需要；配合容器挂载）──
+# 两项参考配置（已知能开机）实测均为 y，故都保留。
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_TMPFS_XATTR=y
+
+# ── 容器网络（官方 GKI 清单里的核心网络项）──
+# NETFILTER_XT_MATCH_ADDRTYPE 是官方 GKI 清单【必列】项（"Networking
+# (Enhanced NAT support)"），且 ABI 安全。宿主的 veth/bridge/NAT/iptables
+# 已由参考配置保证开启（实测 CONFIG_VETH=y / CONFIG_BRIDGE=y /
+# CONFIG_IP_NF_TARGET_MASQUERADE=y / CONFIG_NF_NAT=y / CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y），
+# 因此 NAT 容器可用（IPv4）。
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+
+# ── UFW 支持（官方 "UFW support" 子清单）──
+# 注意：官方清单里的 CONFIG_NETFILTER_XT_TARGET_REJECT【在 6.6 不存在】
+#   （已用 GitHub code search 与 net/*/netfilter/Kconfig 全树检索确认；
+#     参考配置与 run#4 里都没有该符号，
+#     存在的是 CONFIG_IP_NF_TARGET_REJECT / CONFIG_IP6_NF_TARGET_REJECT /
+#     CONFIG_NF_REJECT_IPV4 / CONFIG_NF_REJECT_IPV6，
+#     而这 4 个在本树【默认已开】，无需也无法追加）
+# 故此处只列真正存在且需要开的项。
+CONFIG_NETFILTER_XT_TARGET_LOG=y
+CONFIG_NETFILTER_XT_MATCH_RECENT=y
+
+# ── Fail2ban 支持（官方 "Fail2ban support" 子清单）──
+# 依赖关系：IP_SET_HASH_IP / IP_SET_HASH_NET / NETFILTER_XT_SET 都
+# depends on IP_SET，因此 IP_SET 必须同时为 y。
+# 注意 IP_SET 在本树是 menuconfig（net/netfilter/ipset/Kconfig:2），
+# 不是 config —— ci_apply_config.py 的检查器已按 (menu)?config 匹配。
 CONFIG_IP_SET=y
-CONFIG_IP_SET_MAX=65534
+CONFIG_IP_SET_HASH_IP=y
+CONFIG_IP_SET_HASH_NET=y
+CONFIG_NETFILTER_XT_SET=y
 
 # ── ADIOS IO 调度器（配 adios.patch 的 block/Kconfig.iosched）──
 # 两者必须同时为 y：MQ_IOSCHED_DEFAULT_ADIOS depends on MQ_IOSCHED_ADIOS=y
@@ -52,19 +79,55 @@ CONFIG_MQ_IOSCHED_ADIOS=y
 CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 【绝对禁止】以下项会改变结构体大小且无 padding → 厂商模块 CRC 全变 → bootloop 且无解
-#   CONFIG_CFS_BANDWIDTH=y
-#   CONFIG_CGROUP_PIDS=y
-# 参考配置里这两项都是 "is not set"，本轮保持不动。
+# 【故意不启用】—— 每项都写明理由，避免被误认为遗漏
 #
-# 【TRIM_UNUSED_KSYMS】本轮不在此处设置。理由与处理方式见 ci_apply_config.py
-#   的 --trim 默认行为：通过 --notrim 把 CONFIG_TRIM_UNUSED_KSYMS 关掉。
-#   证据：真机 495 个厂商模块期望 CRC 的 4998 个符号，
-#   与 run#8 的 abi_symbollist.raw 白名单【完全一致】（4998 = 4998，交集 4998），
-#   即白名单已 100% 覆盖全部被引用符号、编译期 0 误裁、CRC 0 冲突，
-#   但 run#8 上机仍 bootloop → 说明厂商模块还依赖未被 __versions 记录的符号
-#   （模块运行时经 kallsyms 查找），裁剪它们同样致命。
-#   而真机内嵌 config 也是 "# CONFIG_TRIM_UNUSED_KSYMS is not set"。
-#   → 本轮用 --notrim 关掉全树裁剪，gki_defconfig 里【不要】写
-#     CONFIG_UNUSED_KSYMS_WHITELIST（未启用 TRIM 时它是死配置，写进去只会误导）。
+# ★ CONFIG_CFS_BANDWIDTH / CONFIG_CGROUP_PIDS —— 永久禁止
+#   官方原文："These two BREAK the kABI and no patch covers them: they resize
+#   scheduler and cgroup structures, which changes the CRC of thousands of
+#   exported symbols. Stock vendor modules then refuse to load and the device
+#   bootloops." 且在 5.15 GKI 上实测改变了约 4000 个导出符号的校验值。
+#   代价：Droidspaces 的 --cpus 与 --pids-limit 不可用（app 里这两个开关置灰，
+#   使用时以警告跳过）。内存限制只需要 CONFIG_MEMCG，已开启。
+#   ci_apply_config.py 里硬编码拒绝这两项，防止后人误加。
+#
+# ★ CONFIG_USER_NS —— 本轮不开
+#   官方列为 "optional but recommended"，作用是修 docker 的
+#   "unsafe procfs" 报错、"Allow Sandboxing" 功能，以及 NAT 模式下容器内
+#   解析用户名。
+#   不开的代价（官方对照表原文）："User namespaces | CONFIG_USER_NS |
+#   Allow Sandboxing is unavailable."
+#   理由：参考配置（已知能开机）实测为 not set；且 CONFIG_USER_NS 会作用于
+#   struct cred / struct user_namespace 等核心结构（虽然本轮已核对 cred.h：
+#   user_ns 字段不受该宏守卫、布局不变，但 user_namespace 本身有该宏守卫的
+#   成员），在当前 kABI 敏感阶段按"与参考配置严格一致"的保守策略处理。
+#   注意：容器仍可运行（PID/IPC/UTS/NET 命名空间与 seccomp 均已满足），
+#   仅缺上述两项边缘功能。
+#
+# ★ CONFIG_IP6_NF_NAT / CONFIG_IP6_NF_TARGET_MASQUERADE —— 本轮不开
+#   代价（官方对照表原文）："IPv6 NAT | CONFIG_IP6_NF_NAT,
+#   CONFIG_IP6_NF_TARGET_MASQUERADE | NAT containers are IPv4 only."
+#   即容器 NAT 出网仅 IPv4，无 NAT66。
+#   理由：参考配置实测为 not set（CONFIG_IP6_NF_NAT=n）。
+#
+# ★ CONFIG_MACVLAN —— 本轮不开
+#   代价（官方对照表原文）："Macvlan | CONFIG_MACVLAN | Macvlan mode is
+#   unavailable." 即 Droidspaces 的 --net=macvlan 不可用；host 模式不受影响。
+#   理由：参考配置实测为 not set。
+#
+# ★ CONFIG_TMPFS_XATTR —— 本轮【开启】
+#   参考配置（已知能开机）实测为 y，故开启。官方也列为需要项
+#   （NixOS 支持、部分容器镜像的 xattr 需求）。
+#
+# ★ CONFIG_NETFILTER_XT_SET 的依赖已满足（见上，已开启）。
+# ★ CONFIG_ANDROID_PARANOID_NETWORK —— 参考配置里该符号不存在（已移除），
+#   无需处理。
+#
+# 【TRIM_UNUSED_KSYMS】本轮显式关闭。证据：
+#   真机内嵌 config = "# CONFIG_TRIM_UNUSED_KSYMS is not set"，
+#   而 run#4 = "=y"。run#8 实测：白名单 4998 个符号与真机 495 个厂商模块
+#   的期望符号【完全一致】（交集 4998、双向差集 0），编译期 0 误裁、
+#   CRC 0 冲突，上机仍 bootloop → 厂商模块还依赖未被 __versions 记录的符号
+#   （运行时经 kallsyms 查找），裁掉它们同样致命。属永久放弃项。
+#   workflow 侧另外传 --notrim（msm-kernel/BUILD.bazel:153/168 把
+#   trim_nonlisted_kmi 硬编码为 True，只改 defconfig 不够）。
 # ─────────────────────────────────────────────────────────────────────────────
