@@ -163,8 +163,32 @@ jobs:
           check kernel_platform/tools/mkbootimg
           check kernel_platform/build/kernel/kleaf
           echo "=== 厂商驱动规模（应 >800 个 .c）==="
-          echo "  charger .c 文件数: $(find vendor/oplus/kernel/charger -name '*.c' 2>/dev/null | wc -l)"
-          echo "  设备树文件数:      $(find kernel_platform/qcom/opensource/devicetree -name '*.dts*' 2>/dev/null | wc -l)"
+          cchg=$(find vendor/oplus/kernel/charger -name '*.c' 2>/dev/null | wc -l)
+          cdts=$(find kernel_platform/qcom/opensource/devicetree -name '*.dts*' 2>/dev/null | wc -l)
+          echo "  charger .c 文件数: $cchg"
+          echo "  设备树文件数:      $cdts"
+          [ "$cchg" -lt 100 ] && { echo "  [FAIL] 充电驱动文件过少，vendor 树没拉全"; FAIL=1; }
+
+          echo "=== prepare_vendor.sh 的硬性前置条件（审计发现）==="
+          # ① linkfile 必须真实存在（repo 会按 manifest 建，这里复核）
+          for lf in kernel_platform/.source_date_epoch_dir \
+                    kernel_platform/build_with_bazel.py ; do
+            if [ -e "$lf" ]; then echo "  [OK]   linkfile $lf"; else echo "  [FAIL] linkfile $lf 缺失"; FAIL=1; fi
+          done
+          # ② kernel_platform 必须位于 <root>/kernel_platform
+          #    （prepare_vendor.sh:508-514 会断言 ANDROID_TO_KP == "kernel_platform"）
+          [ -d kernel_platform ] && echo "  [OK]   <root>/kernel_platform 结构正确" \
+            || { echo "  [FAIL] kernel_platform 不在根下"; FAIL=1; }
+          # ③ bionic/libc/kernel/uapi 必须存在（prepare_vendor.sh:555-559 传给 export_headers.py）
+          #    AOSP 树里才有真的；CI 里造一个空的。缺失会导致 UAPI 头导出结果错误
+          #    （所有 kernel 头被判为 MSM specific 而全量导出），不致命但影响正确性。
+          if [ ! -d bionic/libc/kernel/uapi ]; then
+            mkdir -p bionic/libc/kernel/uapi
+            echo "  [INFO] 已创建占位 bionic/libc/kernel/uapi（审计 §7.6 ③）"
+          else
+            echo "  [OK]   bionic/libc/kernel/uapi 存在"
+          fi
+
           if [ "$FAIL" -ne 0 ]; then
             echo "::error::工作区不完整，中止以免编出半成品"
             exit 1
@@ -179,16 +203,80 @@ jobs:
           echo "=== ./kernel_platform/oplus/build/oplus_build_kernel.sh $PLATFORM $VARIANT ==="
           echo "=== 开始: $(date '+%F %T') ==="
 
-          # 注意 oplus_setup.sh 第 12 行会 source 一个不存在的 vendorsetup.sh，
-          # 脚本无 set -e，会打印报错后继续，属已知现象，不要给它造假文件。
-          timeout 10800 bash kernel_platform/oplus/build/oplus_build_kernel.sh \
-            "$PLATFORM" "$VARIANT" 2>&1 | tail -200
+          # 已知现象（源码审计确认，不要"修"）：
+          #   1. oplus_setup.sh:12 source 一个不存在的 vendorsetup.sh
+          #      —— 脚本无 set -e，只打印报错后继续，不影响构建路径
+          #   2. oplus_build_kernel.sh:12 内部是 `prepare_vendor.sh ... | tee log`
+          #      且没有 set -o pipefail —— 编译失败时【脚本仍返回 0】！
+          #      所以退出码不可信，必须靠产物断言判定成败（见下一步）
+          #
+          # 为拿到真实退出码，这里不复用 oplus_build_kernel.sh，而是等价展开它：
+          #   source oplus_setup.sh <p> <v>   -> 顶层 choose_* 消费参数、设置变量
+          #   init_build_environment          -> 导出 TOPDIR/ANDROID_* 等
+          #   prepare_vendor.sh sun perf      -> 真正的构建（内部 set -e）
+          # 这样 set -e + pipefail 才真正生效。
+          mkdir -p LOGDIR
+          set -o pipefail
+          export TOPDIR="$(pwd)"
+          set +e
+          # < /dev/null 兜底：即使某分支落到 read ANSWER 也会立刻 EOF 返回，
+          # 不会挂住 CI（审计 §7.1）
+          source kernel_platform/oplus/build/oplus_setup.sh "$PLATFORM" "$VARIANT" < /dev/null
+          init_build_environment
+          RC_SETUP=$?
+          echo "=== setup 完成 (rc=$RC_SETUP) ==="
+          echo "  variants_platform=$variants_platform  variants_type=$variants_type"
+          echo "  DIST_INSTALL=$DIST_INSTALL"
+          echo "  KERNEL_OUT=$KERNEL_OUT"
+
+          LOG="LOGDIR/build_$(date +%Y_%m_%d_%H_%M_%S).log"
+          set -e
+          timeout 10800 ./kernel_platform/build/android/prepare_vendor.sh \
+            "$PLATFORM" "$VARIANT" < /dev/null 2>&1 | tee "$LOG" | tail -200
           RC=${PIPESTATUS[0]}
-          echo "=== 结束: $(date '+%F %T') 退出码: $RC ==="
+          echo "=== 结束: $(date '+%F %T') prepare_vendor 退出码: $RC ==="
+          echo "=== 完整日志: $LOG ($(wc -l < "$LOG" 2>/dev/null) 行) ==="
           if [ "$RC" -ne 0 ]; then
-            echo "::error::构建失败（退出码 $RC）"
+            echo "::error::prepare_vendor.sh 失败（退出码 $RC）"
+            echo "--- 日志末尾 60 行 ---"
+            tail -60 "$LOG" 2>/dev/null || true
             exit 1
           fi
+
+      - name: 产物断言（真正的失败判据）
+        if: success()
+        run: |
+          cd "$GITHUB_WORKSPACE/src"
+          FAIL=0
+          # 审计确认的产物路径（$1=sun, $2=perf）
+          DIST="kernel_platform/out/msm-kernel-${PLATFORM}-${VARIANT}/dist"
+          KOUT="device/qcom/${PLATFORM}-kernel"
+          echo "=== 断言 DIST_INSTALL: $DIST ==="
+          if [ -d "$DIST" ]; then
+            ls -lh "$DIST" | head -30
+            # 关键产物：Image 必须有内容
+            if [ -s "$DIST/Image" ]; then
+              echo "  [OK] $DIST/Image ($(stat -c %s "$DIST/Image") 字节)"
+            else
+              echo "  [FAIL] $DIST/Image 缺失或为空"; FAIL=1
+            fi
+          else
+            echo "  [FAIL] DIST_INSTALL 目录不存在"; FAIL=1
+          fi
+          echo "=== 断言 KERNEL_OUT: $KOUT ==="
+          if [ -d "$KOUT" ]; then
+            ls -lh "$KOUT" | head -25
+          else
+            echo "  [WARN] KERNEL_OUT 目录不存在（可能非必经路径）"
+          fi
+          echo "=== 模块产物（充电驱动应在此）==="
+          find "$DIST" -name "*.ko" 2>/dev/null | head -20
+          echo "  .ko 总数: $(find "$DIST" -name '*.ko' 2>/dev/null | wc -l)"
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::构建产物断言失败 —— 编译实际未成功"
+            exit 1
+          fi
+          echo "产物断言通过 ✅"
 
       - name: 收集产物
         if: always()
