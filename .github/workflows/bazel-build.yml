@@ -105,6 +105,24 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/repo" --version
 
+          # ── 禁止内网缓存（源码审计 §7.4）──
+          # 若设了这两个变量，bazel 会去连内网 bazel-remote-cache.myoas.com:9093，
+          # CI 上必然失败。显式清空并写入 GITHUB_ENV，确保后续步骤也不带。
+          unset OPLUS_USE_JFROG_CACHE OPLUS_USE_BUILDBUDDY_REMOTE_BUILD
+          {
+            echo "OPLUS_USE_JFROG_CACHE="
+            echo "OPLUS_USE_BUILDBUDDY_REMOTE_BUILD="
+          } >> "$GITHUB_ENV"
+          echo "  已清空内网缓存变量"
+
+          # JDK：manifest 拉的是 jdk11，但 oplus_setup.sh 把 JAVA_HOME 指到不存在的
+          # jdk21 路径。审计确认主链无代码读它，但为保险起见指向真实存在的 jdk11。
+          if [ -d kernel_platform/prebuilts/jdk/jdk11 ]; then
+            echo "  JDK11 存在: $(ls kernel_platform/prebuilts/jdk/jdk11)"
+          else
+            echo "  [WARN] kernel_platform/prebuilts/jdk/jdk11 不存在（sync 尚未执行，属正常）"
+          fi
+
       - name: repo init（官方 manifest）
         run: |
           set -e
@@ -267,6 +285,11 @@ jobs:
           mkdir -p LOGDIR
           set -o pipefail
           export TOPDIR="$(pwd)"
+          # 修正 JAVA_HOME（oplus_setup.sh 会把它覆盖成不存在的 jdk21 路径；
+          # 这里在 setup 之后再纠正为 manifest 实际提供的 jdk11）
+          if [ -d kernel_platform/prebuilts/jdk/jdk11 ]; then
+            export JAVA_HOME="$(pwd)/kernel_platform/prebuilts/jdk/jdk11"
+          fi
           set +e
           # < /dev/null 兜底：即使某分支落到 read ANSWER 也会立刻 EOF 返回，
           # 不会挂住 CI（审计 §7.1）
