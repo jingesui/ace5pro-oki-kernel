@@ -38,7 +38,7 @@ banner "0. 前置检查"
 [ -d "$KERNEL" ]                       || die "msm-kernel 树不存在: $KERNEL"
 [ -d "$PATCH_DIR" ]                    || die "patches 目录不存在: $PATCH_DIR（repo 是否 checkout 了？）"
 [ -f "$CONFIG_FRAG" ]                  || die "配置片段不存在: $CONFIG_FRAG"
-for p in fengchi-rebased.patch droidspaces.patch adios.patch; do
+for p in fengchi-rebased.patch droidspaces.patch adios.patch hmbird-sa-common-scx.patch; do
   [ -s "$PATCH_DIR/$p" ] || die "补丁缺失或为空: $PATCH_DIR/$p"
 done
 echo "  msm-kernel : $KERNEL"
@@ -105,6 +105,59 @@ git -C "$KERNEL" status --porcelain | awk '{print $1}' | sort | uniq -c
 echo "  改动文件总数: $(git -C "$KERNEL" status --porcelain | wc -l)"
 
 # ─────────────────────────────────────────────────────────────────────────────
+echo
+echo "════════════════════════════════════════════════════════════"
+echo "  1b. 应用 vendor 侧补丁（给 vendor 版 sa_common_struct.h 补 scx 成员）"
+echo "════════════════════════════════════════════════════════════"
+# 为什么需要这个补丁（run#6 实测根因）：
+#   kernel/oplus_cpu 是【符号链接】→ ../../../vendor/oplus/kernel/cpu
+#   所以编译的是 vendor/oplus/kernel/cpu/sched/sched_assist/sa_common.c，
+#   它 #include "sa_common.h"（引号形式 → 先在包含者所在目录找）
+#     → vendor/.../sa_common.h:24  #include "sa_common_struct.h"（同样引号形式）
+#       → 命中【同目录的 vendor 版】sa_common_struct.h
+#   而 vendor 版（4527 B）里的 struct oplus_task_struct 【没有 scx 成员】，
+#   补丁把 scx 放在了 include/linux/sched/sa_common_struct.h（全树无人以
+#   尖括号形式 include 它 → 从未参与编译）；且两者 include guard 同名
+#   (_OPLUS_SA_COMMON_STRUCT_H_)，即便被 include 也会被先到的 vendor 版挡住。
+#   而 vendor sa_common.c:1633 在 #ifdef CONFIG_HMBIRD_SCHED 里用了 18 处
+#   ots->scx.* → run#6 报 "no member named 'scx' in 'struct oplus_task_struct'"。
+#
+# 修法：把 scx 相关的类型定义 + 成员加进【vendor 版】（与补丁版内容逐行一致，
+#       已用 diff 校验），沿用 vendor 版"守卫被注释掉 = 无条件生效"的既有风格
+#       （该文件头部自述：IS_ENABLED 在 OKI 里不生效，故守卫都被注释）。
+# 注意：该补丁作用于【仓库根】$SRC（vendor/ 在根仓库里），不是 msm-kernel 树。
+VENDOR_PATCH="$PATCH_DIR/hmbird-sa-common-scx.patch"
+VENDOR_FILE="$SRC/vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h"
+if [ -f "$VENDOR_FILE" ]; then
+  if ! git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1; then
+    # vendor/ 属于根仓库 android_kernel_modules_and_devicetree_oneplus_sm8750，
+    # repo sync 后 $SRC 本身可能不是 git 仓库（根仓库的 .git 在哪取决于 manifest），
+    # 因此这里不依赖 git，直接用 patch(1) 应用。
+    echo "  $SRC 不是 git 仓库 → 改用 patch -p1"
+    if patch -p1 -d "$SRC" --dry-run < "$VENDOR_PATCH" >/dev/null 2>&1; then
+      patch -p1 -d "$SRC" < "$VENDOR_PATCH"
+      echo "  [OK] hmbird-sa-common-scx.patch 应用成功（patch -p1）"
+    else
+      echo "  --- dry-run 明细 ---"
+      patch -p1 -d "$SRC" --dry-run < "$VENDOR_PATCH" 2>&1 | head -20 || true
+      die "hmbird-sa-common-scx.patch 无法应用（vendor 版 sa_common_struct.h 基线不匹配）"
+    fi
+  else
+    if git -C "$SRC" apply --check --reverse "$VENDOR_PATCH" >/dev/null 2>&1; then
+      echo "  [SKIP] 已应用过（反向 check 通过）"
+    elif git -C "$SRC" apply --whitespace=nowarn -v "$VENDOR_PATCH" 2>&1 | tee "$LOGDIR/apply_vendor_scx.log"; then
+      echo "  [OK] hmbird-sa-common-scx.patch 应用成功（git apply）"
+    else
+      echo "  --- 失败定位 ---"
+      git -C "$SRC" apply --whitespace=nowarn --check -v "$VENDOR_PATCH" 2>&1 | head -30 || true
+      die "hmbird-sa-common-scx.patch 无法应用"
+    fi
+  fi
+else
+  die "找不到 vendor 版 sa_common_struct.h: $VENDOR_FILE"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 banner "2. 补丁断言（fail-fast）"
 
 FAIL=0
@@ -136,6 +189,28 @@ chk "block/Makefile 含 adios.o"                    grep -q 'MQ_IOSCHED_ADIOS.*a
 chk "Kconfig.preempt 定义 HMBIRD_SCHED"            grep -q 'config HMBIRD_SCHED' kernel/Kconfig.preempt
 chk "sched.h 的 KABI 槽 1/2 仍是 RESERVE（未被破坏）" grep -q 'ANDROID_KABI_RESERVE(1);' include/linux/sched.h
 
+# ── vendor 侧 sa_common_struct.h 必须含 scx 成员（run#6 实测根因）──
+# kernel/oplus_cpu 是指向 vendor/oplus/kernel/cpu 的符号链接，
+# 编译的 sa_common.c 走 "sa_common.h" → "sa_common_struct.h"（同目录引号包含）
+# → 用的是 vendor 版。vendor 版原本没有 scx，而 sa_common.c 用了 18 处 ots->scx.*
+# → run#6 报 "no member named 'scx' in 'struct oplus_task_struct'"。
+# 本断言确保 vendor 侧补丁真的生效。
+VENDOR_SC="$SRC/vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h"
+chk "vendor 版 sa_common_struct.h 含 struct scx_entity scx;" \
+    grep -q 'struct scx_entity scx;' "$VENDOR_SC"
+chk "vendor 版 sa_common_struct.h 含 struct scx_task_stats" \
+    grep -q 'struct scx_task_stats {' "$VENDOR_SC"
+chk "vendor 版 sa_common_struct.h 含 SCX_SLICE_DFL" \
+    grep -q 'SCX_SLICE_DFL' "$VENDOR_SC"
+# 确认没有破坏该结构体原有的对齐属性（会改变布局/CRC）
+NVCA=$(grep -c '} ____cacheline_aligned;' "$VENDOR_SC" || true)
+if [ "$NVCA" -eq 1 ]; then
+  echo "  [OK]   struct oplus_task_struct 末尾仍是 ____cacheline_aligned（1 处，布局未破坏）"
+else
+  echo "  [FAIL] ____cacheline_aligned 出现 $NVCA 处（期望 1）—— 结构体布局可能被破坏"
+  FAIL=1
+fi
+
 # 关键定量断言：struct walt_rq 里必须恰好 2 个 _fixed 字段（防止误改到 group_cpu_time）
 NW_FIXED=$(awk '/^struct walt_rq \{/,/^\};/' kernel/sched/walt/walt.h | grep -c 'runnable_sum_fixed' || true)
 if [ "$NW_FIXED" -eq 2 ]; then
@@ -146,30 +221,21 @@ else
   FAIL=1
 fi
 
-# ── 关键防护：确认 common 头文件没有把我们的补丁覆盖掉 ──
-# prepare_vendor.sh:255 有一条 shell 语义错误的判断
-#     if ([[ "$V" == "consolidate" ]] || [[ "$V" == "perf" ]]) && \
-#         [[ !$(grep -q "define_msm_la" ".../$KERNEL_TARGET.bzl") ]]; then
-#         EXTRA_KBUILD_ARGS+=" -g"      # = --gki-headers
-#   [[ !$(...) ]] 中 ! 与 $( 之间没有空格 → 变成 [[ !<非空字符串> ]]
-#   → 恒假 → 恒真分支，会追加 -g
-# 而 build_with_bazel.py 的 --gki-headers 会把 common 树的文件【符号链接】
-# 覆盖到 msm-kernel 上（对 files_gki_aarch64.txt 里的 .h），其中 4 个正是
-# 本补丁改过的文件：
-#     include/linux/sched.h              ← 含 HMBIRD KABI 槽 1/2 + hmbird 内联函数
-#     include/linux/sched/task.h
-#     include/uapi/linux/sched.h
-#     include/asm-generic/vmlinux.lds.h
-# 一旦被覆盖，walt_rq 的 CRC 永远修不好 → 100 分钟白编。
-# run#4 的 build_opts.txt 里没有 -g（实际未触发），但这里必须显式自证。
+# ── 关键防护：确认 include/linux/sched.h 未被 common 头文件覆盖 ──
+# run#6 实测纠正：-g 是【必需】的（msm 的 fs/verity/fsverity_private.h、
+# include/crypto/hash.h 都是陈旧版，需要 common 的新版覆盖），
+# 唯一需要保护的是 include/linux/sched.h（6 个会被覆盖的补丁文件中
+# 只有它 msm 与 common 真正不同，且它是本补丁的核心改动）。
+# 第 4 步已把它从 files_gki_aarch64.txt 中精确移除 → -g 不会动它。
+# 这里再自证一次（若是符号链接或内容不含 HMBIRD 分支，说明保护失效）。
 echo
-echo "=== 防护检查：补丁文件未被 common 头文件符号链接覆盖 ==="
+echo "=== 防护检查：include/linux/sched.h 未被 common 覆盖 ==="
 for f in include/linux/sched.h include/linux/sched/task.h include/uapi/linux/sched.h include/asm-generic/vmlinux.lds.h; do
   if [ -L "$f" ]; then
     echo "  [FAIL] $f 是符号链接 -> $(readlink "$f")（common 头文件覆盖了补丁！）"
     FAIL=1
   else
-    echo "  [OK]   $f 是普通文件（补丁生效）"
+    echo "  [OK]   $f 是普通文件"
   fi
 done
 # 再确认内容确实是补丁后的版本（chen 符号链接之外的其它覆盖方式）
@@ -226,177 +292,96 @@ echo "=== 注入后 gki_defconfig 尾部 ==="
 tail -40 "$KERNEL/arch/arm64/configs/gki_defconfig"
 
 # ─────────────────────────────────────────────────────────────────────────────
-banner "4. 阻止 --gki-headers（-g）覆盖补丁"
+banner "4. --gki-headers（-g）：从清单中【只移除 sched.h】"
 
-# 问题根源（已逐条实测证明）：
-#   prepare_vendor.sh:253-256
+# ── 背景与纠错（run#6 实测，重要）─────────────────────────────────────────
+#   prepare_vendor.sh:253-256 的条件
 #       if ([[ "$KERNEL_VARIANT" == "consolidate" ]] || [[ "$KERNEL_VARIANT" == "perf" ]]) && \
 #           [[ !$(grep -q "define_msm_la" "${ROOT_DIR}/msm-kernel/$KERNEL_TARGET.bzl") ]]; then
 #           EXTRA_KBUILD_ARGS+=" -g"
 #       fi
-#   `[[ !$( ... ) ]]` 里 ! 与 $( 之间【缺空格】→ $(grep -q ...) 因 -q 不输出而恒为空串
-#   → `[[ !<空串> ]]` 【恒真】→ 只要变体是 perf/consolidate，-g 必被追加。
-#   我在本地用 4 种情形实证（sun.bzl 存在/不存在、含/不含 define_msm_la）：
-#   四种全部输出"→ -g 被追加"。
+#   其中 `[[ !$( ... ) ]]` 缺空格 → 恒真 → perf/consolidate 下 -g 必被追加。
 #
-#   而 build_with_bazel.py 的 --gki-headers 会遍历 msm-kernel/files_gki_aarch64.txt，
-#   对每个【含 ".h" 子串】的条目做 os.remove(msm_kernel/<f>) + symlink(common/<f>)。
-#   本补丁改过的 73 个文件里有 6 个正好落在这个列表里且含 ".h"：
-#       include/asm-generic/vmlinux.lds.h
-#       include/linux/sched.h          ← HMBIRD KABI / walt 关键，被覆盖后 CRC 永远修不好
-#       include/linux/sched/task.h
-#       include/uapi/linux/sched.h
-#       kernel/bpf/bpf_struct_ops_types.h
-#       kernel/sched/sched.h
-#   另有 8 个非-.h 的补丁文件（kernel/sched/core.c、kernel/fork.c、kernel/time/tick-sched.c、
-#   kernel/sched/{build_policy,debug,idle}.c、drivers/tty/sysrq.c、init/init_task.c）
-#   会被该分支 finally 里的
-#       git checkout --pathspec-from-file=files_gki_aarch64.txt
-#   还原成基线 → 补丁改动同样被抹掉。
+#   ★ 我最初把 -g 判为"必须阻止的危害"，并整体中和了 files_gki_aarch64.txt
+#     （替换为单一无害路径）。**这是错的**：run#6 因此编译失败，报
+#       fs/verity/verify.c: error: use of undeclared identifier
+#                        'FS_VERITY_MAX_PENDING_DATA_BLOCKS'  (×4)
+#       fs/verity/verify.c: error: call to undeclared function 'crypto_shash_finup_mb'
+#       fs/verity/verify.c: error: no member named 'mb_max_msgs' in 'struct fsverity_hash_alg'
+#     原因：msm-kernel 的 fs/verity/fsverity_private.h 是【陈旧版】(4951 B,
+#     sha 9611eeae35)，缺这些定义；common 的是【新版】(5156 B, sha 0c9e302dcf,
+#     第 36 行 int mb_max_msgs;、第 150 行 #define FS_VERITY_MAX_PENDING_DATA_BLOCKS 2)。
+#     -g 的作用【正是】把 common 的头文件符号链接覆盖到 msm-kernel —— 这是官方设计。
+#     include/crypto/hash.h 同理（msm 36430 B vs common 38837 B，msm 陈旧）。
 #
-#   已核实：files_gki_aarch64.txt 在整个构建里【只有这两处用途】
-#   （build_with_bazel.py:309 的 symlink 循环、:339 的 finally checkout），
-#   BUILD.bazel / msm_kernel_extensions.bzl 都不引用它（实测 grep 均为 0 次）。
+#   交叉验证（决定性）：run#4 成功且同样 CONFIG_FS_VERITY=y。若 run#4 没有 -g，
+#   它会在同一个 fs/verity/verify.c 上以同样的错误失败 → **run#4 的 -g 确实生效**，
+#   即 -g 是 run#4 能编过的【必要条件】。
 #
-# 两层处置：
-#   ① 【根因】把 prepare_vendor.sh 里那个错误条件改成恒假 —— 从源头阻止 -g 加进来。
-#      这是最干净的修法：既不改变"microsoft 该有"的语义（msm-kernel 的 sun.bzl
-#      确实定义了 define_msm_la，本来就不该加 -g），也不依赖任何断言。
-#      备份为 .orig，并打印修改前后对照，便于审计。
-#   ② 【兜底】把 files_gki_aarch64.txt 替换成单一无害路径 "Makefile"
-#      （msm-kernel 根目录确有该文件、被 git 跟踪、本补丁从不修改、字符串不含 ".h"）：
-#      -g 的循环不再命中 → 不 remove/symlink；finally 的 checkout 只涉及它 → 空操作。
-#      即使 ① 因上游脚本变动而失效，② 仍能保证补丁不被覆盖或还原。
-PV="$SRC/kernel_platform/build/android/prepare_vendor.sh"
-if [ -f "$PV" ]; then
-  echo "--- ① 修复 prepare_vendor.sh 的 -g 条件（根因）---"
-  echo "  文件: $PV"
-  if grep -q 'CI-FIX: the original condition' "$PV"; then
-    echo "  [OK] 已修复过，跳过（幂等）"
-  else
-    cp "$PV" "$PV.orig"
-    python3 - "$PV" <<'PYEOF'
-import sys
-
-p = sys.argv[1]
-lines = open(p, errors='replace').read().splitlines(keepends=True)
-
-# 按行定位（比正则稳健：不依赖转义、缩进与续行符的细节）
-# 目标块共 4 行：
-#   <indent>if ([[ "$KERNEL_VARIANT" == "consolidate" ]] || [[ ... == "perf" ]]) && \
-#   <indent>    [[ !$(grep -q "define_msm_la" "${ROOT_DIR}/msm-kernel/$KERNEL_TARGET.bzl") ]]; then
-#   <indent>  EXTRA_KBUILD_ARGS+=" -g"
-#   <indent>fi
-hits = [i for i, l in enumerate(lines)
-        # 跳过注释行：幂等重跑时，原条件已被我们包进注释里，
-        # 若不排除注释，会再次命中并触发形状校验失败。
-        if not l.lstrip().startswith('#')
-        and '!$(grep -q "define_msm_la"' in l and 'KERNEL_TARGET.bzl' in l]
-if len(hits) != 1:
-    sys.stderr.write("::error::定位 -g 条件失败：命中 %d 处（期望 1）\n" % len(hits))
-    sys.exit(1)
-cond_idx = hits[0]
-if_idx = cond_idx - 1
-
-# 逐行校验形状，任何不符即拒绝修改（宁可不动也不改错）
-ok = True
-if 'if (' not in lines[if_idx] or '"perf"' not in lines[if_idx]:
-    ok = False
-if 'EXTRA_KBUILD_ARGS+=" -g"' not in lines[if_idx + 2]:
-    ok = False
-if lines[if_idx + 3].strip() != 'fi':
-    ok = False
-if not ok:
-    sys.stderr.write("::error::-g 条件块的 4 行形状与预期不符，拒绝修改：\n")
-    for i in range(if_idx, min(if_idx + 4, len(lines))):
-        sys.stderr.write("    %d: %r\n" % (i + 1, lines[i]))
-    sys.exit(1)
-
-indent = lines[if_idx][:len(lines[if_idx]) - len(lines[if_idx].lstrip())]
-comment = [
-    indent + "# CI-FIX: the original condition was\n",
-    indent + '#   if ([[ "$KERNEL_VARIANT" == "consolidate" ]] || [[ "$KERNEL_VARIANT" == "perf" ]]) && \\\n',
-    indent + '#       [[ !$(grep -q "define_msm_la" "${ROOT_DIR}/msm-kernel/$KERNEL_TARGET.bzl") ]]; then\n',
-    indent + "#\n",
-    indent + "# The inner test `[[ !<empty> ]]` has no space between ! and $(, and grep -q\n",
-    indent + "# emits nothing, so it is ALWAYS TRUE -> -g (--gki-headers) was always appended.\n",
-    indent + "# -g replaces msm-kernel headers listed in files_gki_aarch64.txt with symlinks\n",
-    indent + "# into common/, and its `finally` block git-checkouts that same list, which would\n",
-    indent + "# silently wipe our scheduler patches: include/linux/sched.h, kernel/sched/sched.h,\n",
-    indent + "# kernel/sched/core.c, kernel/fork.c, kernel/time/tick-sched.c and 4 others.\n",
-    indent + "# Disabled unconditionally: msm-kernel/sun.bzl does define define_msm_la, so -g\n",
-    indent + "# was never intended here.\n",
-    indent + "if false; then\n",
-    indent + '    EXTRA_KBUILD_ARGS+=" -g"\n',
-    indent + "fi\n",
-]
-lines[if_idx:if_idx + 4] = comment
-open(p, 'w').write(''.join(lines))
-print("  已将 -g 条件（第 %d-%d 行）替换为 `if false; then`" % (if_idx + 1, if_idx + 4))
-PYEOF
-    if [ $? -ne 0 ]; then die "修复 prepare_vendor.sh 失败"; fi
-    echo "  --- 修改后对照 ---"
-    grep -n -B2 -A3 'CI-FIX: the original condition' "$PV" | head -14
-    grep -n 'if false; then' "$PV" | head -3
-    echo "  [OK] 已从源头阻止 -g"
-  fi
-else
-  echo "  [WARN] 未找到 $PV —— 只能依赖 ② 兜底"
-fi
-
-echo
-echo "--- ② 兜底：中和 files_gki_aarch64.txt ---"
+#   那么 -g 到底威胁谁？本补丁改过的 73 个文件里，有 6 个既在清单里又是 .h：
+#       include/asm-generic/vmlinux.lds.h   msm=9b46d4a7aa vs common=9b46d4a7aa  相同
+#       include/linux/sched/task.h          msm=03d35e3eda vs common=03d35e3eda  相同
+#       include/uapi/linux/sched.h          msm=359a14cc76 vs common=359a14cc76  相同
+#       kernel/bpf/bpf_struct_ops_types.h   msm=3618769d85 vs common=3618769d85  相同
+#       kernel/sched/sched.h                msm=cbc478992c vs common=cbc478992c  相同
+#       include/linux/sched.h               msm=6a7adaec26 vs common=464131256d  ★不同
+#   → 只有 include/linux/sched.h 真正不同（其余 5 个覆盖了也无害，且覆盖后内容相同）。
+#     而 sched.h 恰好是本补丁必须保留的文件（HMBIRD KABI 槽 1/2 + hmbird 内联函数）。
+#
+#   ★ 因此正确做法是【精确保护】：只从 files_gki_aarch64.txt 中移除
+#     include/linux/sched.h 这 1 行，其余 3603 行 .h 全部保留 →
+#       · -g 照常为其它头做 common 覆盖（fs/verity、crypto/hash 等拿到新版）
+#       · 只有 sched.h 不被覆盖 → 补丁保留
+#       · build_with_bazel.py 的 finally 用同一清单做 git checkout →
+#         也不再还原 sched.h
+#   不再改 prepare_vendor.sh 的条件（撤销 `if false`），不再整体中和清单。
 GKI_LIST="$KERNEL/files_gki_aarch64.txt"
+PROTECT="include/linux/sched.h"
 if [ -f "$GKI_LIST" ]; then
-  echo "  原文: $GKI_LIST（$(wc -l < "$GKI_LIST") 行，含 .h 子串 $(grep -c '\.h' "$GKI_LIST" || true) 行）"
-  if grep -q '^Makefile$' "$GKI_LIST" && [ "$(wc -l < "$GKI_LIST")" -le 1 ]; then
-    echo "  [OK] 已中和过，跳过（幂等）"
+  echo "  清单: $GKI_LIST（$(wc -l < "$GKI_LIST") 行，含 '.h' 子串 $(grep -c '\.h' "$GKI_LIST" || true) 行）"
+  # 幂等：若已备份过 .ci-orig 说明处理过
+  if [ -f "$GKI_LIST.ci-orig" ]; then
+    echo "  [OK] 已处理过（存在 $GKI_LIST.ci-orig），跳过"
   else
-    cp "$GKI_LIST" "$GKI_LIST.orig"
-    # 必须整体替换为「单一无害路径」，不能只删/注释 .h 行（两种做法都错）：
-    #   ① 加注释前缀：判定是子串测试 `if ".h" in f`，
-    #      "#CI-NEUTRALIZED include/linux/sched.h" 里【依然含 ".h"】→ 仍会命中
-    #      （实测：注释方案后仍有 3604 条会被处理）
-    #   ② 只删 .h 行：剩下 8 个非-.h 的补丁文件会被 finally 的 git checkout 还原
-    # 替换为 "Makefile" 则：不含 ".h"（-g 不动作）+ 是真实被跟踪文件
-    # （finally 的 checkout 空操作且退出码 0）。
-    echo "Makefile" > "$GKI_LIST"
-    echo "  已替换为单一无害路径（原 $(wc -l < "$GKI_LIST.orig") 行 -> 1 行）"
-    if grep -q '\.h' "$GKI_LIST"; then
-      die "中和失败：清单里仍含 '.h'，-g 会覆盖补丁文件"
+    cp "$GKI_LIST" "$GKI_LIST.ci-orig"
+    if grep -qxF "$PROTECT" "$GKI_LIST"; then
+      # 删掉【精确匹配这一行】（不是删所有含 sched.h 的行！）
+      grep -vxF "$PROTECT" "$GKI_LIST.ci-orig" > "$GKI_LIST"
+      echo "  已移除 1 行: $PROTECT（$(( $(wc -l < "$GKI_LIST.ci-orig") - $(wc -l < "$GKI_LIST") )) 行）"
+    else
+      echo "  [WARN] 清单里没有精确匹配的 '$PROTECT' 行（上游变动？）"
     fi
-    echo "  [OK] 无 '.h' 子串 → --gki-headers 不会覆盖或删除任何文件"
   fi
+  # 复核 1：sched.h 必须已不在清单里
+  if grep -qxF "$PROTECT" "$GKI_LIST"; then
+    die "$PROTECT 仍在清单里 → -g 会覆盖补丁"
+  fi
+  echo "  [OK] '$PROTECT' 已不在清单中 → -g 不会覆盖它"
+  # 复核 2：其它 .h 必须仍在（证明只是精确移除、没有过度中和）
+  NH=$(grep -c '\.h' "$GKI_LIST" || true)
+  echo "  清单中仍保留的 .h 行数: $NH（应为 3603 = 原 3604 减 1）"
+  if [ "$NH" -lt 3000 ]; then
+    die "清单里 .h 行数仅 $NH，疑似过度中和（-g 会被破坏）"
+  fi
+  # 复核 3：关键的新版头文件仍在清单里（-g 必须能覆盖它们）
+  for f in fs/verity/fsverity_private.h include/crypto/hash.h; do
+    if grep -qxF "$f" "$GKI_LIST"; then
+      echo "  [OK] '$f' 仍在清单中 → -g 会为它做 common 覆盖（fs/verity 等能编过）"
+    else
+      die "'$f' 不在清单中 → fs/verity 等会用到陈旧头而编译失败"
+    fi
+  done
 else
-  echo "  [WARN] 未找到 $GKI_LIST"
+  die "找不到 $GKI_LIST（无法确认 -g 行为）"
 fi
 
-echo
-echo "=== 复核：6 个高风险 .h 文件与 8 个非-.h 文件均不受影响 ==="
-for f in include/linux/sched.h kernel/sched/sched.h kernel/sched/core.c kernel/sched/walt/walt.h \
-         include/asm-generic/vmlinux.lds.h include/uapi/linux/sched.h; do
-  printf "  %-42s %s\n" "$f" "$(git -C "$KERNEL" hash-object "$f" | cut -c1-12)"
-done
-
-# 打印反证：若没有这两层防护，-g 会覆盖/还原哪些补丁文件。
-# 用于事后审计（万一上游脚本又改回去）。
-echo
-echo "=== 反证记录：若无防护，-g 会影响的补丁文件 ==="
-if [ -f "$KERNEL/files_gki_aarch64.txt.orig" ]; then
-  for f in include/asm-generic/vmlinux.lds.h include/linux/sched.h \
-           include/linux/sched/task.h include/uapi/linux/sched.h \
-           kernel/bpf/bpf_struct_ops_types.h kernel/sched/sched.h; do
-    if grep -qxF "$f" "$KERNEL/files_gki_aarch64.txt.orig"; then
-      echo "  [原会 symlink 覆盖] $f"
-    fi
-  done
-  for f in drivers/tty/sysrq.c init/init_task.c kernel/fork.c kernel/sched/build_policy.c \
-           kernel/sched/core.c kernel/sched/debug.c kernel/sched/idle.c kernel/time/tick-sched.c; do
-    if grep -qxF "$f" "$KERNEL/files_gki_aarch64.txt.orig"; then
-      echo "  [原会 git checkout 还原] $f"
-    fi
-  done
+# 幂等清理：撤销 run#6 版的过度中和痕迹（若曾存在）
+PV="$SRC/kernel_platform/build/android/prepare_vendor.sh"
+if [ -f "$PV.orig" ] && grep -q 'CI-FIX: the original condition' "$PV" 2>/dev/null; then
+  echo "  [INFO] 检测到上一版留下的 prepare_vendor.sh 修改，已还原为上游原文"
+  cp "$PV.orig" "$PV"
 fi
+
 
 banner "5. 完成"
 echo "  补丁: 3 个已应用并通过断言"
