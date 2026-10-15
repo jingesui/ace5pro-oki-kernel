@@ -52,11 +52,21 @@ jobs:
     steps:
       - name: 清理磁盘 + 显示资源
         run: |
+          # 磁盘是本方案最大风险：repo sync 需 ~7 GiB，bazel 产物可能 10+ GiB，
+          # 而 ubuntu-latest 清理后约 25 GiB。尽可能腾空。
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /opt/hostedtoolcache /usr/local/lib/node_modules \
-            /opt/az /usr/local/share/powershell /usr/share/swift 2>/dev/null || true
+            /opt/az /usr/local/share/powershell /usr/share/swift \
+            /opt/google /usr/lib/jvm /usr/local/.ghcup /opt/hostedtoolcache \
+            /usr/local/share/chromium /usr/share/miniconda /opt/conda 2>/dev/null || true
           sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb 2>/dev/null || true
           echo "=== 磁盘 ==="; df -h /
+          AVAIL=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
+          echo "  可用: ${AVAIL} GiB（需 >= 20 才安全）"
+          if [ "${AVAIL:-0}" -lt 20 ]; then
+            echo "::warning::可用空间仅 ${AVAIL} GiB，可能不足以完成构建"
+          fi
           echo "=== 内存 ==="; free -h
           echo "=== CPU ==="; nproc
 
@@ -160,8 +170,24 @@ jobs:
           if [ "$OK" -ne 1 ]; then echo "::error::repo sync 失败"; exit 1; fi
           echo "=== repo sync 成功 ==="
 
-          echo "=== 磁盘 ==="; df -h / | tail -1
+          echo "=== sync 后磁盘 ==="; df -h / | tail -1
           echo "=== 顶层内容 ==="; ls -la | head -20
+
+          # ── 磁盘瘦身：repo sync 后 .git 目录含大量对象，编译不需要 ──
+          # 保留工作树，清掉 git 历史对象（省 3-8 GiB）
+          echo "=== 清理 .git 对象（编译不需要，显著省空间）==="
+          du -sh .repo 2>/dev/null | sed 's/^/  .repo: /'
+          find . -maxdepth 4 -name ".git" -type d 2>/dev/null | while read g; do
+            d=$(dirname "$g")
+            sz=$(du -sm "$g" 2>/dev/null | cut -f1)
+            # 只清理 >20 MB 的，避免误伤
+            if [ "${sz:-0}" -gt 20 ]; then
+              rm -rf "$g"
+            fi
+          done
+          # .repo 必须保留（repo 工具元数据），但可清理其 project-objects 缓存
+          rm -rf .repo/project-objects 2>/dev/null || true
+          echo "=== 清理后磁盘 ==="; df -h / | tail -1
 
       - name: 校验工作区完整性（缺一个就编不出可用内核）
         run: |
@@ -253,6 +279,9 @@ jobs:
           echo "  KERNEL_OUT=$KERNEL_OUT"
 
           LOG="LOGDIR/build_$(date +%Y_%m_%d_%H_%M_%S).log"
+          # 注意：build_with_bazel.py 会在 cwd（kernel_platform）下建 bazel-cache/
+          # 并设 TEST_TMPDIR 指向它 —— 输出会落在源码树内，与 sync 的空间叠加。
+          echo "=== 编译前磁盘 ==="; df -h / | tail -1
           set -e
           timeout 10800 ./kernel_platform/build/android/prepare_vendor.sh \
             "$PLATFORM" "$VARIANT" < /dev/null 2>&1 | tee "$LOG" | tail -200
