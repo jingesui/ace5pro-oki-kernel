@@ -2992,7 +2992,9 @@ index 005025f..c091539 100644
 +#include "hmbird/hmbird_misc.c"
  #endif
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 7b8a90a..8ebf4a9 100644
+old mode 100755
+new mode 100644
+index 7b8a90a..8ebf4a9
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -96,6 +96,12 @@
@@ -14848,7 +14850,9 @@ index cbc4789..e35473a 100644
  
  #endif /* _KERNEL_SCHED_SCHED_H */
 diff --git a/kernel/sched/walt/walt.h b/kernel/sched/walt/walt.h
-index b0b0755..0807afd 100644
+old mode 100755
+new mode 100644
+index b0b0755..0807afd
 --- a/kernel/sched/walt/walt.h
 +++ b/kernel/sched/walt/walt.h
 @@ -257,6 +257,8 @@ struct walt_rq {
