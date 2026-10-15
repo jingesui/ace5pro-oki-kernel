@@ -119,6 +119,18 @@ jobs:
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/src"
+          # CodeLinaro 偶发 HTTP 500（实测：同一 URL 间歇性失败，重试即恢复）
+          # 因此给 sync 加多轮重试；repo sync 本身幂等（可续传）
+          echo "=== CodeLinaro 连通性预检 ==="
+          for u in \
+            https://git.codelinaro.org/clo/la/kernelplatform/prebuilts-master/clang/host/linux-x86 \
+            https://git.codelinaro.org/clo/la/kernel_platform/external/dtc \
+          ; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$u" || echo 000)
+            echo "  $code  $u"
+          done
+          echo "（500/000 属已知偶发，靠重试解决，不中止）"
+
           # 先试带 --depth=1（省体积），失败则退回不带 depth 的完整 sync
           # 背景：实测 CodeLinaro 支持 `git fetch --depth=1 origin <sha>`，
           #       但 repo 不同版本对 --depth + SHA revision 的处理可能不同，
@@ -130,12 +142,23 @@ jobs:
             return ${PIPESTATUS[0]}
           }
 
-          if sync_try --depth=1; then
-            echo "=== repo sync（带 --depth=1）成功 ==="
-          else
-            echo "::warning::带 --depth=1 的 sync 失败，退回完整 sync（更慢、更占空间）"
-            sync_try || { echo "::error::repo sync 失败"; exit 1; }
+          OK=0
+          for attempt in 1 2 3; do
+            echo "=== repo sync 第 $attempt 轮（--depth=1）==="
+            if sync_try --depth=1; then OK=1; break; fi
+            echo "::warning::第 $attempt 轮失败（CodeLinaro 偶发 500 / 网络抖动），10 秒后重试"
+            sleep 10
+          done
+          if [ "$OK" -ne 1 ]; then
+            echo "::warning::带 --depth=1 三轮均失败，退回完整 sync（更慢、更占空间）"
+            for attempt in 1 2; do
+              echo "=== repo sync 第 $attempt 轮（无 depth）==="
+              if sync_try; then OK=1; break; fi
+              sleep 15
+            done
           fi
+          if [ "$OK" -ne 1 ]; then echo "::error::repo sync 失败"; exit 1; fi
+          echo "=== repo sync 成功 ==="
 
           echo "=== 磁盘 ==="; df -h / | tail -1
           echo "=== 顶层内容 ==="; ls -la | head -20
