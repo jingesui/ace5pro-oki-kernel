@@ -1,0 +1,244 @@
+name: Build Ace5Pro OKI Kernel (Bazel/kleaf 完整构建)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 为什么用 Bazel 而不是 make：
+#   一加内核源码分 17 个仓库（3 个 OnePlusOSS + 14 个 CodeLinaro prebuilts）。
+#   厂商驱动（充电/传感器/设备树）在 android_kernel_modules_and_devicetree_*
+#   仓库里，且必须通过 kernel_platform/oplus/build/oplus_build_kernel.sh 构建，
+#   该脚本内部调用 ./tools/bazel —— 纯 make 体系无法编译厂商驱动。
+#
+#   只用 make 编内核主体（common/）的后果（实测）：内核缺充电驱动，系统加载
+#   不匹配的预编译模块，充电控制异常，主电源轨 XVDD/DVDD 掉电，PMIC 复位。
+#
+# 仓库结构（按 kernel_manifest 的 sm8650 manifest 改写为 sm8750）：
+#   android_kernel_common_oneplus_sm8750                  -> kernel_platform/common
+#   android_kernel_oneplus_sm8750                         -> kernel_platform/msm-kernel
+#   android_kernel_modules_and_devicetree_oneplus_sm8750  -> ./（叠加到根）
+#   + 14 个 CodeLinaro prebuilts
+# ─────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant_type:
+        description: '构建变体 (user/userdebug)'
+        type: choice
+        options: [user, userdebug]
+        default: user
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      BR: oneplus/sm8750_v_15.0.0_oneplus_ace5_pro
+      CHIPSET: sm8750
+      VARIANT: ${{ inputs.variant_type }}
+
+    steps:
+      - name: 清理磁盘 + 显示资源
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache /usr/local/lib/node_modules
+          sudo apt-get clean
+          echo "=== 磁盘 ==="; df -h /
+          echo "=== 内存 ==="; free -h
+          echo "=== CPU ==="; nproc
+
+      - name: 设置 SWAP
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          if ! sudo fallocate -l 12G /swapfile 2>/dev/null; then
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=12288 status=progress
+          fi
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          swapon --show
+          free -h
+          SW=$(free -m | awk '/^Swap:/{print $2}')
+          [ "${SW:-0}" -lt 1000 ] && { echo "::error::swap 未生效"; exit 1; } || true
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev python3 cpio dwarves \
+            zip unzip curl git patch rsync \
+            openjdk-17-jdk-headless 2>&1 | tail -3
+          echo "=== git 版本（需 >= 2.30）==="
+          git --version
+          java -version 2>&1 | head -2
+
+      # ───────────────────────────────────────────────────────────
+      # repo 工具：官方用 repo 管理 17 个仓库，但 repo 需要 manifest
+      # 里每个 project 都可用。这里不用 repo，改用直接 git clone，
+      # 因为我们的机型（sm8750）没有官方 manifest，且 repo 会拉全历史
+      # 导致体积过大。直接 clone + 指定 prebuilt 的 commit。
+      # ───────────────────────────────────────────────────────────
+      - name: 克隆 3 个 OnePlusOSS 主仓库
+        run: |
+          set -e
+          echo "=== [1/3] kernel_platform/common ==="
+          git clone --depth=1 -b "$BR" \
+            https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750 \
+            kernel_platform/common
+
+          echo "=== [2/3] kernel_platform/msm-kernel ==="
+          git clone --depth=1 -b "$BR" \
+            https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750 \
+            kernel_platform/msm-kernel
+
+          echo "=== [3/3] 厂商模块+设备树（叠加到根）==="
+          git clone --depth=1 -b "$BR" \
+            https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750 \
+            mdt_tmp
+          cp -a mdt_tmp/. ./
+          rm -rf mdt_tmp
+
+          echo "=== 验证 ==="
+          for p in \
+            kernel_platform/common/Makefile \
+            kernel_platform/msm-kernel/BUILD.bazel \
+            vendor/oplus/kernel/charger/Makefile \
+            kernel_platform/oplus/build/oplus_build_kernel.sh \
+          ; do
+            [ -e "$p" ] && echo "  [OK]   $p" || { echo "  [FAIL] $p"; exit 1; }
+          done
+
+      - name: 克隆 CodeLinaro prebuilts（14 个，约 4-5 GB）
+        run: |
+          set -e
+          CL=https://git.codelinaro.org/clo/la
+          # 格式: <仓库路径>|<目标路径>|<commit>
+          # commit 来自 kernel_manifest 的 sm8650 manifest（prebuilts 与芯片无关，通用）
+          PREBUILTS=(
+            "kernel/prebuilts/build-tools|kernel_platform/prebuilts/kernel-build-tools|d153b7ab4a4956198957e258d4f370e875c53059"
+            "kernel_platform/build/bazel_common_rules|kernel_platform/build/bazel_common_rules|415b543d5e1d270a22f8c6ae9d848b3560472062"
+            "kernel_platform/external/bazel-skylib|kernel_platform/external/bazel-skylib|7fdbc462f5001b7e82f026aa90bd43c494e2a8d8"
+            "kernel_platform/external/dtc|kernel_platform/external/dtc|3a8c1bbce993f9143835c7f40eeefcdf948cfaf5"
+            "kernel_platform/external/python/absl-py|kernel_platform/external/python/absl-py|e46584edbb247bf79c74c4f105b6fff18234cee8"
+            "kernel_platform/external/stardoc|kernel_platform/external/stardoc|0d74fed6f8d0844f696771e71bc0b071cae99021"
+            "kernel_platform/prebuilts/bazel/linux-x86_64|kernel_platform/prebuilts/bazel/linux-x86_64|eee09422f02e60f28192bcb5a8ce8660baba6706"
+            "kernel_platform/prebuilts/build-tools|kernel_platform/prebuilts/build-tools|cad7e11de82b3307000e09c9d539b2700bd17aea"
+            "kernel_platform/prebuilts/clang-tools|kernel_platform/prebuilts/clang-tools|0613fc5443d035335a9541994607bacae03750f2"
+            "kernel_platform/prebuilts/jdk/jdk11|kernel_platform/prebuilts/jdk/jdk11|ced68c9308cbc1b6ec3e602dba8d0d56df8b6d73"
+            "kernel_platform/system/tools/mkbootimg|kernel_platform/tools/mkbootimg|b17f184a20744a7e0a421f901bdf20a23be22b07"
+            "kernel_platform/toolchain/prebuilts/ndk/r23|kernel_platform/prebuilts/ndk-r23|269a5dc9e862f78dc2030d9262f73cb2642b8127"
+            "kernelplatform/prebuilts-master/clang/host/linux-x86|kernel_platform/prebuilts/clang/host/linux-x86|28b975ada54f8610ed531a6b57253aed10e7c87d"
+            "kernelplatform/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8|kernel_platform/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8|dd099b5d68822602228e2af66693e61e7b54e0a9"
+          )
+          n=0; fail=0
+          for entry in "${PREBUILTS[@]}"; do
+            IFS='|' read -r repo dest commit <<< "$entry"
+            n=$((n+1))
+            printf '  [%2d/%d] %-56s ' "$n" "${#PREBUILTS[@]}" "$(basename $dest)"
+            mkdir -p "$(dirname $dest)"
+            if git clone --depth=1 -b "$commit" "$CL/$repo" "$dest" >/dev/null 2>&1 \
+               || git clone --depth=1 "$CL/$repo" "$dest" >/dev/null 2>&1; then
+              echo "OK ($(du -sh $dest 2>/dev/null | cut -f1))"
+            else
+              echo "FAIL"; fail=$((fail+1))
+            fi
+          done
+          echo "=== 成功 $((n-fail))/$n, 失败 $fail ==="
+          [ "$fail" -ne 0 ] && { echo "::error::prebuilt 克隆失败 $fail 个"; exit 1; } || true
+          echo "=== 磁盘占用 ==="; df -h / | tail -1
+
+      - name: 建立 linkfile（manifest 里声明的符号链接）
+        run: |
+          set -e
+          cd kernel_platform
+          # linkfile 语义：dest 是要创建的链接，src 相对于该 project 的 path
+          # 目标一律用相对路径，避免 CI 上绝对路径失效
+          mkdir -p build/prebuilts build/build-tools
+
+          # project: common          path=kernel_platform/common
+          ln -sfn common/.source_date_epoch_dir .source_date_epoch_dir
+
+          # project: msm-kernel      path=kernel_platform/msm-kernel
+          ln -sfn msm-kernel/bazel.WORKSPACE WORKSPACE
+          ln -sfn msm-kernel/build_with_bazel.py build_with_bazel.py
+
+          # project: kernel/prebuilts/build-tools  path=kernel_platform/prebuilts/kernel-build-tools
+          ln -sfn ../prebuilts/kernel-build-tools build/prebuilts/kernel-build-tools
+
+          # project: kernel_platform/prebuilts/build-tools
+          ln -sfn ../prebuilts/build-tools build/prebuilts/build-tools
+
+          # project: kernel_platform/prebuilts/clang-tools
+          ln -sfn ../prebuilts/clang-tools build/prebuilts/clang-tools
+
+          # project: x86_64-linux-glibc2.17-4.8 -> build/build-tools/sysroot
+          ln -sfn ../../prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot \
+            build/build-tools/sysroot
+
+          echo "=== 链接有效性验证（必须能穿透）==="
+          lfail=0
+          for l in \
+            .source_date_epoch_dir \
+            WORKSPACE \
+            build_with_bazel.py \
+            build/prebuilts/kernel-build-tools \
+            build/prebuilts/build-tools \
+            build/prebuilts/clang-tools \
+            build/build-tools/sysroot \
+          ; do
+            if [ -e "$l" ]; then echo "  [OK]   $l"; else echo "  [FAIL] $l (断链)"; lfail=1; fi
+          done
+          [ "$lfail" -ne 0 ] && { echo "::error::linkfile 有断链"; exit 1; } || true
+          echo "=== 关键项检查 ==="
+          fail=0
+          for p in \
+            WORKSPACE \
+            build_with_bazel.py \
+            prebuilts/bazel/linux-x86_64 \
+            prebuilts/clang/host/linux-x86 \
+            prebuilts/jdk/jdk11 \
+            build/kernel/kleaf \
+          ; do
+            if [ -e "$p" ]; then echo "  [OK]   $p"; else echo "  [FAIL] $p"; fail=1; fi
+          done
+          [ "$fail" -ne 0 ] && { echo "::error::工作区不完整"; exit 1; } || true
+
+      - name: 显示构建脚本用法
+        run: |
+          echo "=== oplus_build_kernel.sh ==="
+          head -40 kernel_platform/oplus/build/oplus_build_kernel.sh
+          echo
+          echo "=== oplus_setup.sh 里支持的平台/变体 ==="
+          grep -nE "variants_platform|variants_type|SM8750|sm8750" \
+            kernel_platform/oplus/build/oplus_setup.sh | head -20
+
+      - name: 构建内核（Bazel via oplus_build_kernel.sh）
+        run: |
+          set -o pipefail
+          cd kernel_platform
+          chmod +x oplus/build/*.sh 2>/dev/null || true
+          # 官方入口: ./oplus/build/oplus_build_kernel.sh <platform> <variant>
+          #   platform=sm8750  variant=user
+          echo "=== 开始构建（预计 20-40 分钟）==="
+          timeout 2700 bash oplus/build/oplus_build_kernel.sh "$CHIPSET" "$VARIANT" 2>&1 | tail -120
+          echo "=== 退出码: $? ==="
+          echo "=== 产物搜索 ==="
+          find . -maxdepth 6 \( -name "Image" -o -name "*.img" -o -name "boot.img" \) \
+            -newermt "-60 minutes" 2>/dev/null | head -20
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ace5Pro-Bazel-${{ inputs.variant_type }}
+          path: |
+            kernel_platform/oplus/prebuild/out/**
+            kernel_platform/out/**/dist/**
+            kernel_platform/out/**/*.img
+            kernel_platform/bazel-bin/**/*.img
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 7
