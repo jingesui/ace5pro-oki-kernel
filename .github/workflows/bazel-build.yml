@@ -123,6 +123,11 @@ jobs:
             echo "  [WARN] kernel_platform/prebuilts/jdk/jdk11 不存在（sync 尚未执行，属正常）"
           fi
 
+      - name: 取出仓库脚本（inject_clone_depth.py 等）
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
       - name: repo init（官方 manifest）
         run: |
           set -e
@@ -159,16 +164,40 @@ jobs:
           done
           echo "（500/000 属已知偶发，靠重试解决，不中止）"
 
-          # ─────────────────────────────────────────────────────────
+                    # ─────────────────────────────────────────────────────────
           # 浅克隆：repo sync 【没有】 --depth 参数（实测报错：
           #   main.py: error: no such option: --depth）。
-          # 深度控制写在 manifest 的 clone-depth 属性里，所以这里改
-          # .repo/manifests/<file>：给 <default> 注入 clone-depth="1"。
           #
-          # 为什么必须浅克隆：官方 manifest 不带 clone-depth = 全量克隆，
-          # 30 个 CodeLinaro 仓库含完整历史约 25.9 GiB，25 GB runner 必爆盘。
+          # 而且 clone-depth 只能写在 <project> 上，不能写在 <default> 上！
+          #   manifest_xml.py:1963 在 _ParseProject() 里读它；
+          #   _Default 类的属性列表里根本没有 clone_depth。
+          # 上一轮注入到 <default> → 静默无效 → repo 拉全历史 25.9 GiB
+          # → 磁盘写满 → System.IO.IOException: No space left on device。
+          #
+          # 正确做法：给【每个 <project>】注入 clone-depth="1"。
+          # 官方 manifest 不带它 = 全量克隆，25 GB runner 必爆盘；
           # 浅克隆后工作树约 3.9 GiB。
           # ─────────────────────────────────────────────────────────
+          MF=".repo/manifests/$MANIFEST_FILE"
+          echo "=== 给每个 <project> 注入 clone-depth=1 ==="
+          cp "$MF" "$MF.orig"
+          # 用仓库里的脚本注入（避免在 YAML 里嵌套 heredoc）
+          INJECT="$GITHUB_WORKSPACE/repo/tools/inject_clone_depth.py"
+          if [ ! -f "$INJECT" ]; then
+            echo "::error::缺少 $INJECT（需先 checkout 仓库）"
+            exit 1
+          fi
+          python3 "$INJECT" "$MF"
+          echo "=== 校验：注入数量应等于 project 数 ==="
+          NP=$(grep -c '<project' "$MF")
+          ND=$(grep -c 'clone-depth' "$MF")
+          echo "  project=$NP  clone-depth=$ND"
+          if [ "$ND" -lt "$NP" ]; then
+            echo "::error::clone-depth 注入不完整（$ND/$NP），会导致全量克隆爆盘"
+            exit 1
+          fi
+          python3 -c "import xml.etree.ElementTree as ET,sys; ET.parse(sys.argv[1]); print('  XML 合法')" "$MF" \
+            || { echo "::error::注入后 manifest XML 非法"; exit 1; }
           MF=".repo/manifests/$MANIFEST_FILE"
           echo "=== 给 manifest 注入 clone-depth=1 ==="
           cp "$MF" "$MF.orig"
