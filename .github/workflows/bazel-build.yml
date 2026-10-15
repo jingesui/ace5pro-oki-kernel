@@ -550,6 +550,27 @@ jobs:
             --allow clk_alpha_pll_regs
           RC=$?
           echo "=== ci_verify.py 退出码: $RC ==="
+
+          # ── 逐模块 CRC 校验（比符号集合比对更贴近内核 check_version 的真实行为）──
+          # 对每个 .ko 解析其 __versions 段，逐条检查该模块需要的符号是否存在且 CRC 匹配。
+          # 这是"模块能否加载"的直接判据。注意：这是附加校验，
+          # 即使它失败也不掩盖上面的四项闸门结论（两者结果都会打印）。
+          echo
+          echo "=== 逐模块 CRC 校验（附加，独立于上面四项）==="
+          if [ -f "$GITHUB_WORKSPACE/repo/tools/verify_modules.py" ]; then
+            python3 "$GITHUB_WORKSPACE/repo/tools/verify_modules.py" "$DIST" \
+              --symvers "$DIST/Module.symvers" \
+              --allow clk_alpha_pll_regs \
+              --json "$GITHUB_WORKSPACE/src/LOGDIR/per_module_crc.json"
+            RC2=$?
+            echo "=== verify_modules.py 退出码: $RC2 ==="
+            if [ "$RC2" -ne 0 ]; then
+              echo "::error::逐模块 CRC 校验失败 —— 存在模块会被拒绝加载"
+              RC=1
+            fi
+          else
+            echo "  [WARN] 缺少 tools/verify_modules.py，跳过"
+          fi
           exit $RC
 
       - name: 收集产物

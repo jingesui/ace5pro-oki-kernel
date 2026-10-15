@@ -292,9 +292,9 @@ echo "=== 注入后 gki_defconfig 尾部 ==="
 tail -40 "$KERNEL/arch/arm64/configs/gki_defconfig"
 
 # ─────────────────────────────────────────────────────────────────────────────
-banner "4. --gki-headers（-g）：从清单中【只移除 sched.h】"
+banner "4. --gki-headers（-g）：保护全部 6 个会被覆盖的补丁文件"
 
-# ── 背景与纠错（run#6 实测，重要）─────────────────────────────────────────
+# ── 背景（三次修正后的最终结论，run#6/run#7 实测）────────────────────────
 #   prepare_vendor.sh:253-256 的条件
 #       if ([[ "$KERNEL_VARIANT" == "consolidate" ]] || [[ "$KERNEL_VARIANT" == "perf" ]]) && \
 #           [[ !$(grep -q "define_msm_la" "${ROOT_DIR}/msm-kernel/$KERNEL_TARGET.bzl") ]]; then
@@ -302,71 +302,92 @@ banner "4. --gki-headers（-g）：从清单中【只移除 sched.h】"
 #       fi
 #   其中 `[[ !$( ... ) ]]` 缺空格 → 恒真 → perf/consolidate 下 -g 必被追加。
 #
-#   ★ 我最初把 -g 判为"必须阻止的危害"，并整体中和了 files_gki_aarch64.txt
-#     （替换为单一无害路径）。**这是错的**：run#6 因此编译失败，报
+#   ★ -g 是【必需】的（不能整体禁掉）：
+#     msm-kernel 的 fs/verity/fsverity_private.h 是陈旧版（4951 B, 9611eeae35），
+#     缺 FS_VERITY_MAX_PENDING_DATA_BLOCKS / mb_max_msgs；
+#     common 的是新版（5156 B, 0c9e302dcf）含这两个定义。
+#     include/crypto/hash.h 同理（msm 36430 B vs common 38837 B）。
+#     run#6 曾把 -g 整体中和 → 报
 #       fs/verity/verify.c: error: use of undeclared identifier
-#                        'FS_VERITY_MAX_PENDING_DATA_BLOCKS'  (×4)
+#                          'FS_VERITY_MAX_PENDING_DATA_BLOCKS'  (×4)
 #       fs/verity/verify.c: error: call to undeclared function 'crypto_shash_finup_mb'
 #       fs/verity/verify.c: error: no member named 'mb_max_msgs' in 'struct fsverity_hash_alg'
-#     原因：msm-kernel 的 fs/verity/fsverity_private.h 是【陈旧版】(4951 B,
-#     sha 9611eeae35)，缺这些定义；common 的是【新版】(5156 B, sha 0c9e302dcf,
-#     第 36 行 int mb_max_msgs;、第 150 行 #define FS_VERITY_MAX_PENDING_DATA_BLOCKS 2)。
-#     -g 的作用【正是】把 common 的头文件符号链接覆盖到 msm-kernel —— 这是官方设计。
-#     include/crypto/hash.h 同理（msm 36430 B vs common 38837 B，msm 陈旧）。
+#     交叉验证：run#4 成功且同样 CONFIG_FS_VERITY=y → -g 在 run#4 必然生效。
 #
-#   交叉验证（决定性）：run#4 成功且同样 CONFIG_FS_VERITY=y。若 run#4 没有 -g，
-#   它会在同一个 fs/verity/verify.c 上以同样的错误失败 → **run#4 的 -g 确实生效**，
-#   即 -g 是 run#4 能编过的【必要条件】。
+#   ★ -g 的危害机制（关键，与"两边内容是否相同"无关）：
+#     build_with_bazel.py 的 --gki-headers 分支：
+#         for f in gki_files:
+#             if ".h" in f:
+#                 os.remove(msm_f)              # 删除【我们打补丁后的】msm 文件
+#                 os.symlink(common_f, msm_f)   # 换成 common 的【未打补丁原始版】
+#     即使 msm 与 common 内容字节完全相同，被删掉的也是【补丁后版本】，
+#     换成原始版 → 补丁改动被丢弃。
+#     run#7 实测：kernel/sched/sched.h:3712: fatal error: 'ext.h' file not found
+#       补丁对该文件 +10/-109，其中删掉了 `#include "ext.h"` 换成
+#       `#ifdef CONFIG_HMBIRD_SCHED / #include "hmbird.h" / #endif`；
+#       而 msm 与 common 的该文件【字节完全相同】(cbc478992cc4, 99494 B)
+#       → -g 覆盖后 `#include "ext.h"` 回来，而 ext.h 已被补丁删除 → 报错。
+#     同理 kernel/bpf/bpf_struct_ops_types.h 补丁删掉 4 行（含
+#       `#include <linux/sched/ext.h>`），而这 4 行在 common 版里存在
+#       → 覆盖后同样报错。
 #
-#   那么 -g 到底威胁谁？本补丁改过的 73 个文件里，有 6 个既在清单里又是 .h：
-#       include/asm-generic/vmlinux.lds.h   msm=9b46d4a7aa vs common=9b46d4a7aa  相同
-#       include/linux/sched/task.h          msm=03d35e3eda vs common=03d35e3eda  相同
-#       include/uapi/linux/sched.h          msm=359a14cc76 vs common=359a14cc76  相同
-#       kernel/bpf/bpf_struct_ops_types.h   msm=3618769d85 vs common=3618769d85  相同
-#       kernel/sched/sched.h                msm=cbc478992c vs common=cbc478992c  相同
-#       include/linux/sched.h               msm=6a7adaec26 vs common=464131256d  ★不同
-#   → 只有 include/linux/sched.h 真正不同（其余 5 个覆盖了也无害，且覆盖后内容相同）。
-#     而 sched.h 恰好是本补丁必须保留的文件（HMBIRD KABI 槽 1/2 + hmbird 内联函数）。
-#
-#   ★ 因此正确做法是【精确保护】：只从 files_gki_aarch64.txt 中移除
-#     include/linux/sched.h 这 1 行，其余 3603 行 .h 全部保留 →
-#       · -g 照常为其它头做 common 覆盖（fs/verity、crypto/hash 等拿到新版）
-#       · 只有 sched.h 不被覆盖 → 补丁保留
-#       · build_with_bazel.py 的 finally 用同一清单做 git checkout →
-#         也不再还原 sched.h
-#   不再改 prepare_vendor.sh 的条件（撤销 `if false`），不再整体中和清单。
+#   ★ 因此正确做法：保护【补丁改过、含 .h、且在清单里】的全部 6 个文件。
+#     本补丁 73 个文件里恰好这 6 个（已逐一核对 +N/-M 与 blob sha）：
+#       include/asm-generic/vmlinux.lds.h    +1/-1     msm==common
+#       include/linux/sched.h               +89/-11    msm≠common
+#       include/linux/sched/task.h           +4/-2     msm==common
+#       include/uapi/linux/sched.h           +1/-1     msm==common
+#       kernel/bpf/bpf_struct_ops_types.h    +0/-4     msm==common
+#       kernel/sched/sched.h               +10/-109    msm==common
+#     做法：从 files_gki_aarch64.txt 中精确移除这 6 行（其余 3598 行 .h 保留
+#     → -g 仍为 fs/verity、crypto/hash 等做 common 覆盖）。
+#     build_with_bazel.py 的 finally 用同一清单做 git checkout →
+#     也不再还原这 6 个文件。
+#   不再改 prepare_vendor.sh 的条件，不再整体中和清单。
 GKI_LIST="$KERNEL/files_gki_aarch64.txt"
-PROTECT="include/linux/sched.h"
+PROTECT_LIST="
+include/asm-generic/vmlinux.lds.h
+include/linux/sched.h
+include/linux/sched/task.h
+include/uapi/linux/sched.h
+kernel/bpf/bpf_struct_ops_types.h
+kernel/sched/sched.h
+"
+PROTECT_LIST=$(echo "$PROTECT_LIST" | grep -v '^$')
+NPROT=$(echo "$PROTECT_LIST" | wc -l)
 if [ -f "$GKI_LIST" ]; then
   echo "  清单: $GKI_LIST（$(wc -l < "$GKI_LIST") 行，含 '.h' 子串 $(grep -c '\.h' "$GKI_LIST" || true) 行）"
-  # 幂等：若已备份过 .ci-orig 说明处理过
+  echo "  需保护的补丁文件: $NPROT 个"
   if [ -f "$GKI_LIST.ci-orig" ]; then
-    echo "  [OK] 已处理过（存在 $GKI_LIST.ci-orig），跳过"
+    echo "  [OK] 已处理过（存在 $GKI_LIST.ci-orig），跳过移除步骤"
   else
     cp "$GKI_LIST" "$GKI_LIST.ci-orig"
-    if grep -qxF "$PROTECT" "$GKI_LIST"; then
-      # 删掉【精确匹配这一行】（不是删所有含 sched.h 的行！）
-      grep -vxF "$PROTECT" "$GKI_LIST.ci-orig" > "$GKI_LIST"
-      echo "  已移除 1 行: $PROTECT（$(( $(wc -l < "$GKI_LIST.ci-orig") - $(wc -l < "$GKI_LIST") )) 行）"
-    else
-      echo "  [WARN] 清单里没有精确匹配的 '$PROTECT' 行（上游变动？）"
+    # 用精确整行匹配逐个移除（不用正则，避免误删 include/linux/sched.h 之外的 sched 相关行）
+    echo "$PROTECT_LIST" > /tmp/ci_protect.txt
+    grep -vxF -f /tmp/ci_protect.txt "$GKI_LIST.ci-orig" > "$GKI_LIST"
+    rm -f /tmp/ci_protect.txt
+    echo "  已移除 $(($(wc -l < "$GKI_LIST.ci-orig") - $(wc -l < "$GKI_LIST"))) 行"
+  fi
+  # ── 复核 1：6 个文件必须都已不在清单里 ──
+  LEFT=0
+  for f in $PROTECT_LIST; do
+    if grep -qxF "$f" "$GKI_LIST"; then
+      echo "  [FAIL] '$f' 仍在清单里 → -g 会覆盖它"
+      LEFT=$((LEFT+1))
     fi
-  fi
-  # 复核 1：sched.h 必须已不在清单里
-  if grep -qxF "$PROTECT" "$GKI_LIST"; then
-    die "$PROTECT 仍在清单里 → -g 会覆盖补丁"
-  fi
-  echo "  [OK] '$PROTECT' 已不在清单中 → -g 不会覆盖它"
-  # 复核 2：其它 .h 必须仍在（证明只是精确移除、没有过度中和）
+  done
+  if [ "$LEFT" -ne 0 ]; then die "$LEFT 个受保护文件仍在清单中"; fi
+  echo "  [OK] 6 个受保护文件均已不在清单中 → -g 不会覆盖它们"
+  # ── 复核 2：其它 .h 必须仍在（防止过度中和）──
   NH=$(grep -c '\.h' "$GKI_LIST" || true)
-  echo "  清单中仍保留的 .h 行数: $NH（应为 3603 = 原 3604 减 1）"
+  echo "  清单中仍保留的 .h 行数: $NH（应为 3598 = 原 3604 减 6）"
   if [ "$NH" -lt 3000 ]; then
-    die "清单里 .h 行数仅 $NH，疑似过度中和（-g 会被破坏）"
+    die "清单里 .h 行数仅 $NH，疑似过度中和（会破坏 fs/verity 等）"
   fi
-  # 复核 3：关键的新版头文件仍在清单里（-g 必须能覆盖它们）
+  # ── 复核 3：关键的新版头文件仍在清单里 ──
   for f in fs/verity/fsverity_private.h include/crypto/hash.h; do
     if grep -qxF "$f" "$GKI_LIST"; then
-      echo "  [OK] '$f' 仍在清单中 → -g 会为它做 common 覆盖（fs/verity 等能编过）"
+      echo "  [OK] '$f' 仍在清单中 → -g 会为它做 common 覆盖"
     else
       die "'$f' 不在清单中 → fs/verity 等会用到陈旧头而编译失败"
     fi
@@ -375,7 +396,70 @@ else
   die "找不到 $GKI_LIST（无法确认 -g 行为）"
 fi
 
-# 幂等清理：撤销 run#6 版的过度中和痕迹（若曾存在）
+# ── 复核 4：受保护文件的内容必须仍是【补丁后版本】──────────────
+# 这是最直接的断言：确认补丁改动还在（而不是被 common 版顶掉）。
+echo
+echo "=== 复核受保护文件的内容（必须是补丁后版本）==="
+K2="$KERNEL"
+ck_has()  { grep -q "$2" "$K2/$1" && echo "  [OK]   $1 含 $3" || { echo "  [FAIL] $1 不含 $3（可能被 common 覆盖）"; FAIL=1; }; }
+ck_not()  { grep -q "$2" "$K2/$1" && { echo "  [FAIL] $1 仍含 $3（补丁的删除被恢复）"; FAIL=1; } || echo "  [OK]   $1 不含 $3"; }
+ck_has include/linux/sched.h              'CONFIG_HMBIRD_SCHED'          'HMBIRD 分支'
+ck_not include/linux/sched.h              '#include <linux/sched/ext.h>' 'ext.h include'
+ck_has kernel/sched/sched.h               'CONFIG_HMBIRD_SCHED'          'HMBIRD 分支'
+ck_not kernel/sched/sched.h               '^#include "ext\.h"'           'ext.h include（补丁已删）'
+ck_not kernel/bpf/bpf_struct_ops_types.h  'sched_ext_ops'                'sched_ext_ops（补丁已删）'
+ck_has include/linux/sched/task.h         'CONFIG_HMBIRD_SCHED'          'HMBIRD 分支'
+ck_has include/uapi/linux/sched.h         'SCHED_HMBIRD'                 'SCHED_HMBIRD（补丁新增）'
+ck_not include/uapi/linux/sched.h         'SCHED_EXT'                    'SCHED_EXT（补丁已删）'
+ck_has kernel/sched/sched.h               'hmbird.h'                     'hmbird.h include（补丁新增）'
+ck_has include/asm-generic/vmlinux.lds.h  '.'                            '文件存在（+1/-1 改动）'
+
+# ── 复核 5：★ 穷举断言（不硬编码路径，未来自动拦截）──────────────────
+# 判据来源：补丁自身。从 patches/*.patch 提取所有"含 .h 且被修改（非新增/非删除）"
+# 的文件，与当前清单中的 .h 行取交集，必须为空。
+# 这样未来任何人往补丁里加新的 .h 文件、或上游改了清单，都会被自动拦住，
+# 不必再靠人肉列举。
+echo
+echo "=== 穷举断言：补丁修改的 .h 文件 与 清单 的交集必须为空 ==="
+python3 - "$PATCH_DIR" "$GKI_LIST" <<'PYEOF'
+import re, sys, glob, os
+patch_dir, gki = sys.argv[1], sys.argv[2]
+cand = set()
+for pat in sorted(glob.glob(os.path.join(patch_dir, "*.patch"))):
+    txt = open(pat, errors="replace").read()
+    for b in re.split(r"(?m)^diff --git ", txt):
+        if not b:
+            continue
+        head = b.split("\n")[0]
+        m = re.match(r"a/(\S+) b/\S+", head)
+        if not m:
+            continue
+        f = m.group(1)
+        if not f.endswith(".h"):
+            continue
+        first = "\n".join(b.split("\n")[1:5])
+        # 整文件新增/删除不需要保护：
+        #   新增 → common 里没有同名文件，-g 不会 symlink 到它
+        #   删除 → 清单里没有（已核实 ext.h/ext.c 均不在清单）
+        if "new file mode" in first or "deleted file mode" in first:
+            continue
+        cand.add(f)
+lines = [l.strip() for l in open(gki, errors="replace") if l.strip()]
+gki_set = set(lines)
+overlap = sorted(cand & gki_set)
+print("  补丁中【含 .h 且被修改】的文件数: %d" % len(cand))
+print("  当前清单中的条目数            : %d" % len(lines))
+print("  交集（会被 -g 覆盖的补丁文件） : %d" % len(overlap))
+for f in overlap:
+    print("     ★ %s" % f)
+if overlap:
+    sys.stderr.write("::error::仍有 %d 个补丁文件在清单中，-g 会覆盖它们（补丁改动会被丢弃）\n" % len(overlap))
+    sys.exit(1)
+print("  [OK] 交集为空 → 没有任何补丁文件会被 -g 覆盖")
+PYEOF
+if [ $? -ne 0 ]; then die "穷举断言失败：仍有补丁文件会被 -g 覆盖"; fi
+
+# 幂等清理：若上一版留下 prepare_vendor.sh 修改痕迹，还原为上游原文
 PV="$SRC/kernel_platform/build/android/prepare_vendor.sh"
 if [ -f "$PV.orig" ] && grep -q 'CI-FIX: the original condition' "$PV" 2>/dev/null; then
   echo "  [INFO] 检测到上一版留下的 prepare_vendor.sh 修改，已还原为上游原文"
