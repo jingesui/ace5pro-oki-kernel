@@ -29,9 +29,9 @@ on:
         options: ['perf', 'consolidate']
         default: 'perf'
       repo_jobs:
-        description: 'repo 并发数（过高易被限流）'
+        description: 'repo 并发数（默认 2，过高易触发 Gitaly 过载）'
         type: string
-        default: '4'
+        default: '2'
 
 permissions:
   contents: read
@@ -143,7 +143,7 @@ jobs:
           ls .repo/manifests/ | head
           grep -c "<project" .repo/manifests/$MANIFEST_FILE
 
-      - name: repo sync（33 个仓库，约 5-15 GB，耗时较长）
+      - name: repo sync（33 个仓库，浅克隆后约 3.9 GB 工作树）
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/src"
@@ -159,33 +159,58 @@ jobs:
           done
           echo "（500/000 属已知偶发，靠重试解决，不中止）"
 
-          # 先试带 --depth=1（省体积），失败则退回不带 depth 的完整 sync
-          # 背景：实测 CodeLinaro 支持 `git fetch --depth=1 origin <sha>`，
-          #       但 repo 不同版本对 --depth + SHA revision 的处理可能不同，
-          #       因此保留 fallback，避免因参数不兼容而整轮失败。
+          # ─────────────────────────────────────────────────────────
+          # 浅克隆：repo sync 【没有】 --depth 参数（实测报错：
+          #   main.py: error: no such option: --depth）。
+          # 深度控制写在 manifest 的 clone-depth 属性里，所以这里改
+          # .repo/manifests/<file>：给 <default> 注入 clone-depth="1"。
+          #
+          # 为什么必须浅克隆：官方 manifest 不带 clone-depth = 全量克隆，
+          # 30 个 CodeLinaro 仓库含完整历史约 25.9 GiB，25 GB runner 必爆盘。
+          # 浅克隆后工作树约 3.9 GiB。
+          # ─────────────────────────────────────────────────────────
+          MF=".repo/manifests/$MANIFEST_FILE"
+          echo "=== 给 manifest 注入 clone-depth=1 ==="
+          cp "$MF" "$MF.orig"
+          if grep -q 'clone-depth' "$MF"; then
+            echo "  manifest 已含 clone-depth，跳过"
+          else
+            sed -i 's|<default \([^>]*\)/>|<default \1 clone-depth="1" />|' "$MF"
+            grep -q 'clone-depth' "$MF" \
+              || { echo "  [WARN] sed 未命中，尝试匹配多行 default"; }
+          fi
+          echo "=== 修改后的 default 行 ==="
+          grep -o '<default[^>]*>' "$MF" | head -2
+
+          # 并发降到 2：Gitaly 过载是上次失败的直接原因之一，降并发更稳
+          # （浅克隆本身已大幅降低单仓请求量，双重保险）
+          REPO_JOBS=2
+
+          # CodeLinaro 的 Gitaly 后端会间歇性不可用：
+          #   remote: The git server, Gitaly, is not available at this time.
+          # 属服务端问题，只能退避重试。repo sync 可续传，已下载的不重下。
           sync_try() {
-            echo "=== repo sync $* ==="
-            timeout 5400 repo sync -c -j"$REPO_JOBS" --no-tags --force-sync \
-              --no-clone-bundle "$@" 2>&1 | tail -60
+            echo "=== repo sync -c -j$REPO_JOBS --no-tags --force-sync --no-clone-bundle ==="
+            timeout 3000 repo sync -c -j"$REPO_JOBS" --no-tags --force-sync \
+              --no-clone-bundle 2>&1 | tail -80
             return ${PIPESTATUS[0]}
           }
 
           OK=0
-          for attempt in 1 2 3; do
-            echo "=== repo sync 第 $attempt 轮（--depth=1）==="
-            if sync_try --depth=1; then OK=1; break; fi
-            echo "::warning::第 $attempt 轮失败（CodeLinaro 偶发 500 / 网络抖动），10 秒后重试"
-            sleep 10
+          for attempt in 1 2 3 4 5; do
+            WAIT=$(( attempt * 30 ))
+            echo "=== repo sync 第 $attempt/5 轮（失败则等 ${WAIT}s 重试）==="
+            if sync_try; then OK=1; break; fi
+            echo "::warning::第 $attempt 轮失败（Gitaly 服务端不可用或网络抖动）"
+            if [ "$attempt" -lt 5 ]; then
+              echo "等待 ${WAIT} 秒后重试（可续传）"
+              sleep "$WAIT"
+            fi
           done
           if [ "$OK" -ne 1 ]; then
-            echo "::warning::带 --depth=1 三轮均失败，退回完整 sync（更慢、更占空间）"
-            for attempt in 1 2; do
-              echo "=== repo sync 第 $attempt 轮（无 depth）==="
-              if sync_try; then OK=1; break; fi
-              sleep 15
-            done
+            echo "::error::repo sync 五轮均失败"
+            exit 1
           fi
-          if [ "$OK" -ne 1 ]; then echo "::error::repo sync 失败"; exit 1; fi
           echo "=== repo sync 成功 ==="
 
           echo "=== sync 后磁盘 ==="; df -h / | tail -1
