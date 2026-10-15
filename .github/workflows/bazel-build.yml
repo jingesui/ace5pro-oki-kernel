@@ -269,9 +269,41 @@ jobs:
           else
             echo "  [WARN] KERNEL_OUT 目录不存在（可能非必经路径）"
           fi
-          echo "=== 模块产物（充电驱动应在此）==="
+          echo "=== 模块产物 ==="
           find "$DIST" -name "*.ko" 2>/dev/null | head -20
-          echo "  .ko 总数: $(find "$DIST" -name '*.ko' 2>/dev/null | wc -l)"
+          echo "  dist 下 .ko 总数: $(find "$DIST" -name '*.ko' 2>/dev/null | wc -l)"
+
+          # ─────────────────────────────────────────────────────────
+          # 充电驱动 oplus_chg_v2.ko 的归属（源码审计确认）：
+          #   既不在 modules.list.msm.sun（first-stage）
+          #   也不在 modules.vendor_boot.list.oplus（仅 2 个文件）
+          #   → 按 prepare_vendor.sh:414-428 分流到 vendor_dlkm
+          # 含义：只刷 boot.img 修不了充电，必须同时刷 vendor_dlkm.img
+          # ─────────────────────────────────────────────────────────
+          echo "=== 充电驱动归属检查（关键）==="
+          CHG=$(find "$DIST" "$KOUT" kernel_platform/oplus/prebuild -name 'oplus_chg_v2.ko' 2>/dev/null | head -1)
+          if [ -n "$CHG" ]; then
+            echo "  [OK] 找到 oplus_chg_v2.ko: $CHG"
+          else
+            echo "  [FAIL] 未找到 oplus_chg_v2.ko —— 充电驱动仍未参与编译！"
+            echo "         （说明 vendor/oplus 符号链接链未通，或 CONFIG_OPLUS_CHG_V2 未生效）"
+            FAIL=1
+          fi
+          echo "  vendor_dlkm 相关产物:"
+          find "$DIST" "$KOUT" -iname "*vendor_dlkm*" 2>/dev/null | head -10
+          echo "  （注意：vendor_dlkm.img 需与 boot.img 一起刷，否则充电驱动不生效）"
+
+          # 模块符号链接链自检（诊断用，帮助定位断链）
+          echo "=== 厂商驱动符号链接链自检 ==="
+          for sl in drivers/power/oplus drivers/soc/oplus/boot drivers/android/oplus_binder; do
+            p="kernel_platform/msm-kernel/$sl"
+            if [ -L "$p" ]; then
+              if [ -e "$p" ]; then echo "  [OK]   $sl -> $(readlink $p)"
+              else echo "  [FAIL] $sl 断链 -> $(readlink $p)"; FAIL=1; fi
+            else
+              echo "  [WARN] $p 不是符号链接或不存在"
+            fi
+          done
           if [ "$FAIL" -ne 0 ]; then
             echo "::error::构建产物断言失败 —— 编译实际未成功"
             exit 1
