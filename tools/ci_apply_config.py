@@ -56,6 +56,18 @@ def existing_keys(lines):
     return found
 
 
+def symbol_exists_in_any(kconfig_dirs, name):
+    """在多个 Kconfig 树里查找（任一命中即算存在）。
+
+    perf 变体的内核配置来自 common 树，但部分补丁（如 ADIOS）的 Kconfig
+    定义在 msm-kernel 树 —— 必须两棵树都查，否则会假失败。
+    """
+    for d in kconfig_dirs:
+        if d and os.path.isdir(d) and symbol_exists_in_kconfig(d, name):
+            return True
+    return False
+
+
 def symbol_exists_in_kconfig(kconfig_dir, name):
     """在整个 Kconfig 树里找 'config <NAME>' 或 'menuconfig <NAME>'。
 
@@ -97,10 +109,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--defconfig", required=True)
     ap.add_argument("--fragment", required=True)
-    ap.add_argument("--kconfig-dir", default=None,
-                    help="Kconfig 树根（用于校验符号是否存在）。"
-                         "CI 里传 kernel_platform/msm-kernel；本地精简快照可省略，"
-                         "省略时跳过存在性校验")
+    ap.add_argument("--kconfig-dir", default=None, action="append",
+                    help="Kconfig 树根（可传多次，用于校验符号是否存在）。"
+                         "CI 里必须同时传 kernel_platform/common 与 "
+                         "kernel_platform/msm-kernel —— 因为 perf 变体的内核配置来自 "
+                         "common 树（base_kernel=//common:kernel_aarch64），而 ADIOS 等"
+                         "补丁的 Kconfig 定义在 msm-kernel 树（block/Kconfig.iosched）。"
+                         "本地精简快照可省略，省略时跳过存在性校验")
     ap.add_argument("--require-all", action="store_true",
                     help="任一符号缺失/校验不通过即失败（默认开启）")
     ap.add_argument("--allow-missing", action="store_true",
@@ -127,13 +142,14 @@ def main():
     lines = read_lines(args.defconfig)
     have = existing_keys(lines)
 
-    have_kconfig_tree = bool(args.kconfig_dir) and os.path.isdir(args.kconfig_dir)
+    kdirs = [d for d in (args.kconfig_dir or []) if d and os.path.isdir(d)]
+    have_kconfig_tree = bool(kdirs)
     if have_kconfig_tree and not args.allow_missing:
-        print("  Kconfig 存在性校验: 开启（%s）" % args.kconfig_dir)
+        print("  Kconfig 存在性校验: 开启（%s）" % " + ".join(kdirs))
     else:
         print("  Kconfig 存在性校验: %s"
               % ("【关闭】未提供 Kconfig 树，无法区分『符号不存在』和『快照不全』"
-                 if not args.kconfig_dir else
+                 if not kdirs else
                  "【关闭】--allow-missing（仅限本地精简快照）"))
 
     print("=== 注入配置项 ===")
@@ -150,7 +166,7 @@ def main():
             return 1
         # 符号存在性校验：不存在则跳过（否则 olddefconfig 丢弃 + 告警）
         if have_kconfig_tree and not args.allow_missing:
-            if not symbol_exists_in_kconfig(args.kconfig_dir, key):
+            if not symbol_exists_in_any(kdirs, key):
                 skipped_unknown.append(key)
                 continue
         if key in have:
