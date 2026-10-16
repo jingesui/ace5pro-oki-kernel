@@ -292,7 +292,7 @@ echo "=== 注入后 gki_defconfig 尾部 ==="
 tail -40 "$KERNEL/arch/arm64/configs/gki_defconfig"
 
 # ─────────────────────────────────────────────────────────────────────────────
-banner "4. --gki-headers（-g）：保护全部 6 个会被覆盖的补丁文件"
+banner "4. --gki-headers（-g）：保护全部 7 个会被覆盖的补丁文件"
 
 # ── 背景（三次修正后的最终结论，run#6/run#7 实测）────────────────────────
 #   prepare_vendor.sh:253-256 的条件
@@ -331,22 +331,39 @@ banner "4. --gki-headers（-g）：保护全部 6 个会被覆盖的补丁文件
 #       `#include <linux/sched/ext.h>`），而这 4 行在 common 版里存在
 #       → 覆盖后同样报错。
 #
-#   ★ 因此正确做法：保护【补丁改过、含 .h、且在清单里】的全部 6 个文件。
-#     本补丁 73 个文件里恰好这 6 个（已逐一核对 +N/-M 与 blob sha）：
+#   ★ 因此正确做法：保护【补丁改过、含 .h、且在清单里】的全部 6 个文件，
+#     外加 1 个【依赖型】文件 include/linux/cpufreq.h（run#8 实测），共 7 个。
+#     ── 机制型 6 个（本补丁 73 个文件里恰好这 6 个，已逐一核对 +N/-M 与 blob sha）──
 #       include/asm-generic/vmlinux.lds.h    +1/-1     msm==common
 #       include/linux/sched.h               +89/-11    msm≠common
 #       include/linux/sched/task.h           +4/-2     msm==common
 #       include/uapi/linux/sched.h           +1/-1     msm==common
 #       kernel/bpf/bpf_struct_ops_types.h    +0/-4     msm==common
 #       kernel/sched/sched.h               +10/-109    msm==common
-#     做法：从 files_gki_aarch64.txt 中精确移除这 6 行（其余 3598 行 .h 保留
+#     ── 依赖型 1 个 ──
+#       include/linux/cpufreq.h                        msm≠common
+#       为什么（run#8 实测）：补丁新增的 kernel/sched/hmbird/hmbird.c:3717 调
+#       store_scaling_governor、hmbird_sched_proc.c:210 调 show_scaling_governor，
+#       这两个声明【只在 msm 版 cpufreq.h 里】（msm 1235 行含第 47-49 行三行声明，
+#       common 1231 行没有）。-g 覆盖后声明消失 → 报
+#         error: call to undeclared function 'show_scaling_governor'
+#         error: call to undeclared function 'store_scaling_governor'
+#       （run#8 的 2 个错误，正是这两条）
+#     穷举依据（Lead 已完成，474 个 hmbird 外部调用 × 16 个 msm≠common 差异头
+#     求交集）：只有 cpufreq.h 命中 2 个 → 不存在第 8 个。详见
+#     hmbird/out/PROTECT_ANALYSIS.md（含可复跑命令）。
+#     做法：从 files_gki_aarch64.txt 中精确移除这 7 行（其余 3597 行 .h 保留
 #     → -g 仍为 fs/verity、crypto/hash 等做 common 覆盖）。
 #     build_with_bazel.py 的 finally 用同一清单做 git checkout →
-#     也不再还原这 6 个文件。
+#     也不再还原这 7 个文件。
 #   不再改 prepare_vendor.sh 的条件，不再整体中和清单。
+#   ⚠️ 注意【不要】把 16 个 msm≠common 差异头全保护：
+#     fs/verity/fsverity_private.h、include/crypto/hash.h 的 msm 版是陈旧版，
+#     必须让 -g 用 common 新版，否则退回 run#6 的 25 个错误。
 GKI_LIST="$KERNEL/files_gki_aarch64.txt"
 PROTECT_LIST="
 include/asm-generic/vmlinux.lds.h
+include/linux/cpufreq.h
 include/linux/sched.h
 include/linux/sched/task.h
 include/uapi/linux/sched.h
@@ -367,8 +384,23 @@ if [ -f "$GKI_LIST" ]; then
     grep -vxF -f /tmp/ci_protect.txt "$GKI_LIST.ci-orig" > "$GKI_LIST"
     rm -f /tmp/ci_protect.txt
     echo "  已移除 $(($(wc -l < "$GKI_LIST.ci-orig") - $(wc -l < "$GKI_LIST"))) 行"
+    # ── 复核 0：保护不能是"静默空操作" ──
+    # 若某个受保护路径不在【原始清单】里（拼错 / 上游改名），上面的 grep -vxF
+    # 会静默地什么也不做，而复核 1 依然全绿 → 保护形同虚设。这里显式核对。
+    NPRES=0
+    for f in $PROTECT_LIST; do
+      if grep -qxF "$f" "$GKI_LIST.ci-orig"; then NPRES=$((NPRES+1)); fi
+    done
+    if [ "$NPRES" -ne "$NPROT" ]; then
+      echo "  [FAIL] 原始清单里只找到 $NPRES/$NPROT 个受保护路径 —— 保护是静默空操作"
+      for f in $PROTECT_LIST; do
+        grep -qxF "$f" "$GKI_LIST.ci-orig" || echo "         缺失: $f"
+      done
+      die "保护清单与 files_gki_aarch64.txt 不匹配（上游变动？）"
+    fi
+    echo "  [OK] $NPRES/$NPROT 个受保护路径均存在于原始清单（移除是真实生效的）"
   fi
-  # ── 复核 1：6 个文件必须都已不在清单里 ──
+  # ── 复核 1：7 个文件必须都已不在清单里 ──
   LEFT=0
   for f in $PROTECT_LIST; do
     if grep -qxF "$f" "$GKI_LIST"; then
@@ -377,12 +409,12 @@ if [ -f "$GKI_LIST" ]; then
     fi
   done
   if [ "$LEFT" -ne 0 ]; then die "$LEFT 个受保护文件仍在清单中"; fi
-  echo "  [OK] 6 个受保护文件均已不在清单中 → -g 不会覆盖它们"
+  echo "  [OK] 7 个受保护文件均已不在清单中 → -g 不会覆盖它们"
   # ── 复核 2：其它 .h 必须仍在（防止过度中和）──
   NH=$(grep -c '\.h' "$GKI_LIST" || true)
-  echo "  清单中仍保留的 .h 行数: $NH（应为 3598 = 原 3604 减 6）"
-  if [ "$NH" -lt 3000 ]; then
-    die "清单里 .h 行数仅 $NH，疑似过度中和（会破坏 fs/verity 等）"
+  echo "  清单中仍保留的 .h 行数: $NH（应为 3597 = 原 3604 减 7）"
+  if [ "$NH" -ne 3597 ]; then
+    die "清单里 .h 行数 = $NH（期望恰好 3597 = 3604-7）；过多说明保护不足，过少说明过度中和"
   fi
   # ── 复核 3：关键的新版头文件仍在清单里 ──
   for f in fs/verity/fsverity_private.h include/crypto/hash.h; do
@@ -413,6 +445,38 @@ ck_has include/uapi/linux/sched.h         'SCHED_HMBIRD'                 'SCHED_
 ck_not include/uapi/linux/sched.h         'SCHED_EXT'                    'SCHED_EXT（补丁已删）'
 ck_has kernel/sched/sched.h               'hmbird.h'                     'hmbird.h include（补丁新增）'
 ck_has include/asm-generic/vmlinux.lds.h  '.'                            '文件存在（+1/-1 改动）'
+# ★ 依赖型断言（run#8 的 2 个错误）：cpufreq.h 的这两个声明【只在 msm 版存在】，
+#   被 -g 换成 common 版后 hmbird.c:3717 / hmbird_sched_proc.c:210 会报
+#   "call to undeclared function"。这里做双向自证：
+#     ck_has  → 补丁代码需要的声明必须在
+#     ck_not  → 且不能是 common 版（用 common 版独有的"无声明"特征反证）
+ck_has include/linux/cpufreq.h            'store_scaling_governor'       'store_scaling_governor 声明（hmbird.c:3717 需要）'
+ck_has include/linux/cpufreq.h            'show_scaling_governor'        'show_scaling_governor 声明（hmbird_sched_proc.c:210 需要）'
+# 反向自证：cpufreq.h 必须是【普通文件】而非指向 common 的符号链接
+if [ -L "$K2/include/linux/cpufreq.h" ]; then
+  echo "  [FAIL] include/linux/cpufreq.h 是符号链接 -> $(readlink "$K2/include/linux/cpufreq.h")（被 common 覆盖！）"
+  FAIL=1
+else
+  echo "  [OK]   include/linux/cpufreq.h 是普通文件（未被 common 覆盖）"
+fi
+# 反向自证：common 版 cpufreq.h 的行数与 msm 版不同（1231 vs 1235），
+#   若行数等于 common 版则说明已被覆盖（用行数区间做粗判，避免依赖外部文件）
+NCPL=$(wc -l < "$K2/include/linux/cpufreq.h")
+if [ "$NCPL" -ge 1235 ]; then
+  echo "  [OK]   include/linux/cpufreq.h 行数 = $NCPL（msm 版 ≥1235；common 版为 1231）"
+else
+  echo "  [FAIL] include/linux/cpufreq.h 行数 = $NCPL（< 1235，疑似已被 common 版覆盖）"
+  FAIL=1
+fi
+
+# ★ 关键：复核 4 的 FAIL 必须真的让脚本失败。
+#   历史缺陷：第 2 步末尾（约 273 行）检查过一次 FAIL，但复核 4 在其【之后】，
+#   它设的 FAIL=1 再也没有被消费 → 这些内容断言形同虚设（只打印不拦截）。
+#   这里补上收口，否则"模拟 -g 覆盖 → 断言拦住"的自证无法成立。
+if [ "$FAIL" -ne 0 ]; then
+  echo
+  die "受保护文件内容断言失败 —— 有文件已被 common 版覆盖（见上面 [FAIL] 行）"
+fi
 
 # ── 复核 5：★ 穷举断言（不硬编码路径，未来自动拦截）──────────────────
 # 判据来源：补丁自身。从 patches/*.patch 提取所有"含 .h 且被修改（非新增/非删除）"
