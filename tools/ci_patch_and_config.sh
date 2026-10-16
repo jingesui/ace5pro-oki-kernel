@@ -306,6 +306,70 @@ banner "3. 注入配置项"
 COMMON_KERNEL="$SRC/kernel_platform/common"
 [ -d "$COMMON_KERNEL" ] || die "common 树不存在: $COMMON_KERNEL"
 
+# ⓪ 把 msm 专有符号的 Kconfig 声明补到 common 树
+# ── run#15 实测（完整构建日志，取自 keyfiles artifact）──────────────────────
+#   ERROR: @@//common:kernel_aarch64_config:
+#       CONFIG_MQ_IOSCHED_ADIOS:         actual '', expected '...=y'
+#       CONFIG_MQ_IOSCHED_DEFAULT_ADIOS: actual '', expected '...=y'
+#       CONFIG_HMBIRD_SCHED:             actual '', expected '...=y'
+#       Are they declared in Kconfig?
+#
+#   根因：--defconfig_fragment 是 kleaf 的【全局 flag】，同时作用于
+#         //common:kernel_aarch64_config 与 //msm-kernel:sun_perf_config。
+#         而这三个符号的 Kconfig 定义只在【msm-kernel 树】
+#         （风驰补丁写 kernel/Kconfig.preempt；ADIOS 补丁写 block/Kconfig.iosched）
+#         → common 的 config target 无法让它们生效 → kleaf 检查失败。
+#
+#   这也解释了 run#9 的症状（hmbird 符号 = 0）：最终 .config 来自 common，
+#   而 common 的 Kconfig 缺这三个符号 → CONFIG_HMBIRD_SCHED 永远不可能为 y。
+#
+#   修法：只把【Kconfig 声明】补到 common 树（不补代码 —— common 里没有引用
+#   这些符号的代码，所以对 common 自身是惰性的；而 msm-kernel 的代码本来就在
+#   msm-kernel 树里，由另一个 config target 消费）。
+patch_common_kconfig() {
+  # $1=Kconfig 文件  $2=要补的声明块（多行）  $3=符号名
+  local f="$1" decl="$2" sym="$3"
+  if [ ! -f "$f" ]; then
+    echo "  [WARN] $f 不存在，跳过"
+    return
+  fi
+  if grep -qE "^[[:space:]]*(menu)?config[[:space:]]+$sym[[:space:]]*$" "$f"; then
+    echo "  [OK]   common: $sym 已声明于 $(basename "$f")"
+  else
+    printf '\n%s\n' "$decl" >> "$f"
+    echo "  [注入] common: $sym 声明已补入 $(basename "$f")"
+  fi
+}
+echo "=== 第 3 步前置：把 msm 专有符号的 Kconfig 声明补到 common 树 ==="
+# 声明文本【逐字对齐补丁原文】，避免类型不一致（tristate/bool 差异会影响
+# olddefconfig 的取值接受度）。
+patch_common_kconfig "$COMMON_KERNEL/kernel/Kconfig.preempt" \
+'config HMBIRD_SCHED
+	bool "hmbird Scheduling Class(base on ext scheduler)"
+	help
+	  CI-injected declaration only. The implementation lives in msm-kernel
+	  (kernel/sched/hmbird/), which is the tree that consumes this symbol.' HMBIRD_SCHED
+patch_common_kconfig "$COMMON_KERNEL/block/Kconfig.iosched" \
+'config MQ_IOSCHED_ADIOS
+	tristate "Adaptive Deadline I/O scheduler"
+	default m
+	help
+	  CI-injected declaration only. The implementation (block/adios.c) lives
+	  in msm-kernel, which is the tree that consumes this symbol.
+
+config MQ_IOSCHED_DEFAULT_ADIOS
+	bool "Enable ADIOS I/O scheduler as default MQ I/O scheduler"
+	depends on MQ_IOSCHED_ADIOS=y
+	default n
+	help
+	  CI-injected declaration only.' MQ_IOSCHED_ADIOS
+if grep -qE "^[[:space:]]*(menu)?config[[:space:]]+MQ_IOSCHED_DEFAULT_ADIOS[[:space:]]*$" "$COMMON_KERNEL/block/Kconfig.iosched"; then
+  echo "  [OK]   common: MQ_IOSCHED_DEFAULT_ADIOS 已声明"
+else
+  die "MQ_IOSCHED_DEFAULT_ADIOS 声明补入失败"
+fi
+echo
+
 # ① 生成本轮的 fragment 文件（内容 = ci_config_fragment.txt + HMBIRD/SLIM 处理）
 # ⚠️ run#13 实测：kleaf 的 fragment 解析器【不能有注释行】。
 #    报错原文：
