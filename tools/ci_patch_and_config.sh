@@ -476,13 +476,15 @@ if [ -f "$GKI_LIST" ]; then
   if [ "$NH" -ne 3597 ]; then
     die "清单里 .h 行数 = $NH（期望恰好 3597 = 3604-7）；过多说明保护不足，过少说明过度中和"
   fi
-  # ── 复核 2b：总行数必须恰好 6771（6785-14）──
+  # ── 复核 2b：总行数必须为 6770（实测值）──
+  # 注意：原清单 6785 行【最后一行没有换行符】，wc -l 统计换行符个数 → 实际 6784。
+  # 移除 14 行后 = 6770。run#11 实测 6770，勿改成 6771。
   # 非 .h 的 7 个文件（kernel/sched/core.c 等）也会被 finally 的 git checkout
   # 按同一清单还原，所以必须一并移出。之前只查 .h 是漏洞。
   NTOT=$(wc -l < "$GKI_LIST")
-  echo "  清单总行数: $NTOT（应为 6771 = 原 6785 减 14）"
-  if [ "$NTOT" -ne 6771 ]; then
-    die "清单总行数 = $NTOT（期望恰好 6771 = 6785-14）；过多说明保护不足"
+  echo "  清单总行数: $NTOT（应为 6770；原清单 wc -l = 6784，减 14）"
+  if [ "$NTOT" -ne 6770 ]; then
+    die "清单总行数 = $NTOT（期望 6770）；过多说明保护不足，过少说明过度中和"
   fi
   # ── 复核 3：关键的新版头文件仍在清单里 ──
   for f in fs/verity/fsverity_private.h include/crypto/hash.h; do
