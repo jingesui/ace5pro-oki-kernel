@@ -410,6 +410,18 @@ jobs:
           # 改用补丁步骤里的断言自证：sched.h 必须是普通文件且内容含
           # CONFIG_HMBIRD_SCHED / ANDROID_KABI_USE(6)（见 ci_patch_and_config.sh）。
           export EXTRA_KBUILD_ARGS="--skip abl --notrim"
+          # ── 追加 CI 的 defconfig fragment（kleaf 官方机制，不触发 savedefconfig 校验）──
+          # run#12 实测：直接改 common/gki_defconfig 会因 savedefconfig 一致性校验失败
+          #   ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig
+          # 正解是用 fragment（官方先例：prepare_vendor.sh:238 的 oplus_debug_defconfig）。
+          # 补丁步骤会把 label 写到 LOGDIR/ci_frag_label.txt。
+          if [ -f LOGDIR/ci_frag_label.txt ]; then
+            FRAG=$(cat LOGDIR/ci_frag_label.txt)
+            export EXTRA_KBUILD_ARGS="$EXTRA_KBUILD_ARGS --defconfig_fragment=$FRAG"
+            echo "=== 已追加 defconfig_fragment: $FRAG ==="
+          else
+            echo "::warning::未找到 LOGDIR/ci_frag_label.txt —— 本轮没有 CI 配置注入"
+          fi
           echo "=== EXTRA_KBUILD_ARGS=$EXTRA_KBUILD_ARGS ==="
 
           # 再确认构建命令不会带 -g：显式告知脚本本变体走 msm-kernel 头文件。
