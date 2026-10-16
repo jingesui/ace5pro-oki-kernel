@@ -314,7 +314,13 @@ COMMON_KERNEL="$SRC/kernel_platform/common"
 #        # ── CI ── CONFIG_TMPFS_XATTR ──' from msm-kernel/.../ci_fragments.config
 #    → 它把注释行拼成了配置值的续行，导致匹配失败。
 #    所以这里【只写有效配置行】，注释一律过滤掉。
-CI_FRAG="$KERNEL/arch/arm64/configs/ci_fragments.config"
+# ⚠️ run#14 实测：--defconfig_fragment 是 kleaf 的【全局】flag，
+#   perf 变体的 base_kernel = //common:kernel_aarch64，
+#   所以 bazel 会同时构建 //common:kernel_aarch64_config 和 //msm-kernel:sun_perf_config，
+#   两者都消费这个 fragment。
+#   run#14 报错：//common:kernel_aarch64_config failed (Exit 1)
+#   → fragment 文件必须放在 common 树，label 也指向 //common。
+CI_FRAG="$COMMON_KERNEL/arch/arm64/configs/ci_fragments.config"
 {
   grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$CONFIG_FRAG"
   echo "CONFIG_HMBIRD_SCHED=y"
@@ -336,7 +342,7 @@ python3 "$TOOLS_DIR/ci_apply_config.py" \
   --verify "$CI_FRAG" --allow-missing || die "fragment 符号校验失败"
 
 # ③ 导出给工作流构建步骤（EXTRA_KBUILD_ARGS 追加）
-FRAG_LABEL="//msm-kernel:arch/arm64/configs/ci_fragments.config"
+FRAG_LABEL="//common:arch/arm64/configs/ci_fragments.config"
 echo "$FRAG_LABEL" > "$SRC/LOGDIR/ci_frag_label.txt"
 echo "  [OK] fragment label: $FRAG_LABEL（工作流构建步骤会追加 --defconfig_fragment）"
 
