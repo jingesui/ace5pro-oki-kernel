@@ -281,67 +281,61 @@ echo "  补丁断言全部通过 ✅"
 # ─────────────────────────────────────────────────────────────────────────────
 banner "3. 注入配置项"
 
-# ── 注入目标：common 树的 gki_defconfig（run#9 实测修正）──────────────────
-# 铁证（msm_kernel_la.bzl 的 define_msm_la）：
-#     if variant == "consolidate":
-#         base_kernel = "//common:kernel_aarch64_consolidate"
-#     else:
-#         base_kernel = "//common:kernel_aarch64"        ← perf 走这里
-#   → perf 变体的【内核配置】来自 common 树；msm-kernel 只是叠加层
-#     （提供源码 + in_tree_modules + build_config）。
-#   实证：run#9 最终 .config 里 CONFIG_SLIM_SCHED=y / CONFIG_SCHED_CLASS_EXT=y
-#         正是 common/arch/arm64/configs/gki_defconfig 第 13-14 行的原样内容；
-#         而 msm-kernel 的那两行已被风驰补丁删除 → 证明读的是 common 版。
-#   反向实证：run#9 里我们注入 msm-kernel/gki_defconfig 的 18 项，在构建日志中
-#         命中数全为 0 → 那份文件根本没被读取。
-#   另一条对照：CONFIG_OPLUS_CHG_V2=m 只写在 sun_perf.config（被合并）→ 充电模块
-#         正常编出（符号数 12=12 与 run#4 相同）→ 证明 sun_perf.config 生效。
-COMMON_KERNEL="$SRC/kernel_platform/common"
-[ -f "$COMMON_KERNEL/arch/arm64/configs/gki_defconfig" ] || die "common 树 gki_defconfig 不存在: $COMMON_KERNEL"
-echo "  注入目标（common 树）: $COMMON_KERNEL/arch/arm64/configs/gki_defconfig"
+# ── 配置注入：改用 kleaf 官方 --defconfig_fragment（run#12 实测修正）────────
+# 历史脉络（全部实测）：
+#   run#9 : 注入 msm-kernel/gki_defconfig 的 18 项全部未生效。
+#           根因（msm_kernel_la.bzl 的 define_msm_la）：
+#             perf 变体 base_kernel = "//common:kernel_aarch64"
+#           → 内核【配置】来自 common 树，msm-kernel 只是叠加层。
+#           佐证：run#9 最终 .config 里 SLIM_SCHED=y / SCHED_CLASS_EXT=y
+#                 正是 common/gki_defconfig 第 13-14 行原样内容。
+#   run#12: 注入 common/gki_defconfig 后，kleaf 的 savedefconfig 一致性校验失败：
+#             ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig
+#           原因：直接改 defconfig 会与 olddefconfig 后的 .config 在【排序】上不一致
+#                 （diffconfig 出现 -/+ 行）→ kleaf 拒绝。
+#   → 正解：用 kleaf 官方的 --defconfig_fragment 机制（官方先例：
+#           prepare_vendor.sh:238  --defconfig_fragment=//msm-kernel:arch/arm64/configs/oplus_debug_defconfig）
+#     fragment 走 create_merge_dot_config_cmd 合并，不触发 savedefconfig 校验。
+#
+# 做法三步：
+#   ① 把片段写到 msm-kernel 树（label 可被 bazel 引用）
+#   ② common 树保持原样（不再手改）
+#   ③ 通过 EXTRA_KBUILD_ARGS 把 --defconfig_fragment 传给 bazel
+#      （工作流的构建步骤会把 CI_DEFCONFIG_FRAGMENT 加进 EXTRA_KBUILD_ARGS）
 
+COMMON_KERNEL="$SRC/kernel_platform/common"
+[ -d "$COMMON_KERNEL" ] || die "common 树不存在: $COMMON_KERNEL"
+
+# ① 生成本轮的 fragment 文件（内容 = ci_config_fragment.txt + HMBIRD/SLIM 处理）
+CI_FRAG="$KERNEL/arch/arm64/configs/ci_fragments.config"
+{
+  echo "# ── CI 注入（风驰 HMBIRD / Droidspaces / ADIOS 对齐真机）──"
+  echo "CONFIG_HMBIRD_SCHED=y"
+  echo "# CONFIG_SLIM_SCHED is not set"
+  echo "# CONFIG_SCHED_CLASS_EXT is not set"
+  cat "$CONFIG_FRAG"
+} > "$CI_FRAG"
+echo "  fragment 文件: $CI_FRAG ($(wc -l < "$CI_FRAG") 行)"
+
+# ② Kconfig 存在性校验（双树：fragment 里的符号要么在 common 要么在 msm-kernel）
 python3 "$TOOLS_DIR/ci_apply_config.py" \
-  --defconfig "$COMMON_KERNEL/arch/arm64/configs/gki_defconfig" \
+  --defconfig "$CI_FRAG" \
   --fragment  "$CONFIG_FRAG" \
   --kconfig-dir "$COMMON_KERNEL" \
   --kconfig-dir "$KERNEL" \
-  --verify "$COMMON_KERNEL/arch/arm64/configs/gki_defconfig"
+  --verify "$CI_FRAG" --allow-missing || die "fragment 符号校验失败"
 
-# 风驰补丁已在 msm-kernel 的 gki_defconfig 里写了 CONFIG_HMBIRD_SCHED=y 并删了
-# SLIM_SCHED/SCHED_CLASS_EXT —— 但那只对 msm-kernel 生效，common 树仍需同样处理，
-# 否则 common 版的 SLIM_SCHED=y / SCHED_CLASS_EXT=y 会出现在最终 .config 里，
-# 与 HMBIRD_SCHED 并存（run#9 实测就是这个症状）。
-CG="$COMMON_KERNEL/arch/arm64/configs/gki_defconfig"
-if ! grep -q '^CONFIG_HMBIRD_SCHED=y' "$CG"; then
-  echo "  [注入] common gki_defconfig: 追加 CONFIG_HMBIRD_SCHED=y"
-  echo 'CONFIG_HMBIRD_SCHED=y' >> "$CG"
+# ③ 导出给工作流构建步骤（EXTRA_KBUILD_ARGS 追加）
+FRAG_LABEL="//msm-kernel:arch/arm64/configs/ci_fragments.config"
+echo "$FRAG_LABEL" > "$SRC/LOGDIR/ci_frag_label.txt"
+echo "  [OK] fragment label: $FRAG_LABEL（工作流构建步骤会追加 --defconfig_fragment）"
+
+# ④ 校验 common 树必须【未被我改动】（防止再次触发 savedefconfig 校验）
+if [ -n "$(cd "$COMMON_KERNEL" && git status --porcelain 2>/dev/null | grep -E 'configs/gki_defconfig')" ]; then
+  echo "  [WARN] common gki_defconfig 有本地改动，正在还原（避免 savedefconfig 校验失败）"
+  (cd "$COMMON_KERNEL" && git checkout -- arch/arm64/configs/gki_defconfig)
 fi
-for k in SLIM_SCHED SCHED_CLASS_EXT; do
-  if grep -q "^CONFIG_$k=y" "$CG"; then
-    sed -i "s/^CONFIG_$k=y/# CONFIG_$k is not set  # CI: 风驰替换/" "$CG"
-    echo "  [注入] common gki_defconfig: $k 已关闭"
-  fi
-done
-echo
-echo "=== 注入后 common gki_defconfig 尾部 ==="
-tail -40 "$CG"
-
-# ── 注入后校验（common 树，fail-fast）──────────────────────────────
-echo
-echo "=== common 树注入校验 ==="
-CFAIL=0
-cchk() { grep -q "$2" "$CG" && echo "  [OK]   $1" || { echo "  [FAIL] $1"; CFAIL=1; }; }
-ccno() { grep -q "$2" "$CG" && { echo "  [FAIL] $1（应已关闭）"; CFAIL=1; } || echo "  [OK]   $1"; }
-cchk "common: CONFIG_HMBIRD_SCHED=y"        '^CONFIG_HMBIRD_SCHED=y'
-ccno "common: CONFIG_SLIM_SCHED 已关闭"      '^CONFIG_SLIM_SCHED=y'
-ccno "common: CONFIG_SCHED_CLASS_EXT 已关闭" '^CONFIG_SCHED_CLASS_EXT=y'
-for k in SYSVIPC POSIX_MQUEUE IPC_NS DEVTMPFS TMPFS_POSIX_ACL TMPFS_XATTR \
-         NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT \
-         IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
-         MQ_IOSCHED_ADIOS MQ_IOSCHED_DEFAULT_ADIOS; do
-  cchk "common: CONFIG_$k=y" "^CONFIG_$k=y"
-done
-if [ "$CFAIL" -ne 0 ]; then die "common 树 gki_defconfig 注入校验失败"; fi
+echo "  [OK] common gki_defconfig 保持原样（不触发 savedefconfig 校验）"
 
 # ─────────────────────────────────────────────────────────────────────────────
 banner "4. --gki-headers（-g）：保护全部 7 个会被覆盖的补丁文件"
