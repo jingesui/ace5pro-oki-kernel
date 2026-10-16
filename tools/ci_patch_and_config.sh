@@ -304,6 +304,7 @@ python3 "$TOOLS_DIR/ci_apply_config.py" \
   --defconfig "$COMMON_KERNEL/arch/arm64/configs/gki_defconfig" \
   --fragment  "$CONFIG_FRAG" \
   --kconfig-dir "$COMMON_KERNEL" \
+  --kconfig-dir "$KERNEL" \
   --verify "$COMMON_KERNEL/arch/arm64/configs/gki_defconfig"
 
 # 风驰补丁已在 msm-kernel 的 gki_defconfig 里写了 CONFIG_HMBIRD_SCHED=y 并删了
