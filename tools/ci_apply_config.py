@@ -197,8 +197,14 @@ def main():
             return 1
 
     # ── TRIM_UNUSED_KSYMS ──
+    # ⚠️ run#13 实测：当 --defconfig 是 kleaf fragment 时，【不要】写这一行。
+    #   kleaf 的 fragment 检查器会拿它与最终 .config 逐字比对，而构建步骤的
+    #   --notrim 让 kleaf 的 _config_trim 在 disable 分支直接 return []，
+    #   .config 里根本不会出现 "# CONFIG_TRIM_UNUSED_KSYMS is not set" 这一行
+    #   → 报错 CONFIG_TRIM_UNUSED_KSYMS: actual ''。
+    #   --notrim 本身就是保证，fragment 里写反而 mismatch。
     print()
-    if args.trim == "off":
+    if args.trim == "off" and not args.allow_missing:
         tkey = "CONFIG_TRIM_UNUSED_KSYMS"
         tline = "# CONFIG_TRIM_UNUSED_KSYMS is not set"
         if tkey in have:
@@ -247,7 +253,7 @@ def main():
         got = vlines[vkeys[key]].strip()
         if got != line:
             bad.append("%s 期望 %r 实际 %r" % (key, line, got))
-    if args.trim == "off":
+    if args.trim == "off" and not args.allow_missing:
         got = vlines[vkeys["CONFIG_TRIM_UNUSED_KSYMS"]].strip() if "CONFIG_TRIM_UNUSED_KSYMS" in vkeys else "<缺失>"
         if got != "# CONFIG_TRIM_UNUSED_KSYMS is not set":
             bad.append("CONFIG_TRIM_UNUSED_KSYMS 期望未启用，实际 %r" % got)
