@@ -307,15 +307,25 @@ COMMON_KERNEL="$SRC/kernel_platform/common"
 [ -d "$COMMON_KERNEL" ] || die "common 树不存在: $COMMON_KERNEL"
 
 # ① 生成本轮的 fragment 文件（内容 = ci_config_fragment.txt + HMBIRD/SLIM 处理）
+# ⚠️ run#13 实测：kleaf 的 fragment 解析器【不能有注释行】。
+#    报错原文：
+#      CONFIG_TMPFS_XATTR: actual 'CONFIG_TMPFS_XATTR=y',
+#        expected 'CONFIG_TMPFS_XATTR=y
+#        # ── CI ── CONFIG_TMPFS_XATTR ──' from msm-kernel/.../ci_fragments.config
+#    → 它把注释行拼成了配置值的续行，导致匹配失败。
+#    所以这里【只写有效配置行】，注释一律过滤掉。
 CI_FRAG="$KERNEL/arch/arm64/configs/ci_fragments.config"
 {
-  echo "# ── CI 注入（风驰 HMBIRD / Droidspaces / ADIOS 对齐真机）──"
+  grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$CONFIG_FRAG"
   echo "CONFIG_HMBIRD_SCHED=y"
   echo "# CONFIG_SLIM_SCHED is not set"
   echo "# CONFIG_SCHED_CLASS_EXT is not set"
-  cat "$CONFIG_FRAG"
 } > "$CI_FRAG"
-echo "  fragment 文件: $CI_FRAG ($(wc -l < "$CI_FRAG") 行)"
+# ⚠️ 不要往 fragment 里写 "# CONFIG_TRIM_UNUSED_KSYMS is not set"。
+#   run#13 实测报错：CONFIG_TRIM_UNUSED_KSYMS: actual ''（.config 里根本没有那一行）。
+#   因为构建步骤已传 --notrim，kleaf 的 _config_trim 在 disable 分支直接 return []，
+#   它不会往 .config 写这一行 → fragment 里写了反而 mismatch。--notrim 本身就是保证。
+echo "  fragment 文件: $CI_FRAG ($(wc -l < "$CI_FRAG") 行, 纯配置行无注释)"
 
 # ② Kconfig 存在性校验（双树：fragment 里的符号要么在 common 要么在 msm-kernel）
 python3 "$TOOLS_DIR/ci_apply_config.py" \
