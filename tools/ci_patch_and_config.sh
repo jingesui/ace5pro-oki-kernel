@@ -174,9 +174,9 @@ chk() { # chk <描述> <命令...>
 cd "$KERNEL"
 chk "kernel/sched/hmbird/hmbird.c 已创建"          test -f kernel/sched/hmbird/hmbird.c
 chk "kernel/sched/hmbird/hmbird_sched.h 已创建"   test -f kernel/sched/hmbird/hmbird_sched.h
-chk "gki_defconfig 含 CONFIG_HMBIRD_SCHED=y"       grep -q '^CONFIG_HMBIRD_SCHED=y' arch/arm64/configs/gki_defconfig
-chk "gki_defconfig 已无 CONFIG_SLIM_SCHED"         bash -c '! grep -q "CONFIG_SLIM_SCHED" arch/arm64/configs/gki_defconfig'
-chk "gki_defconfig 已无 CONFIG_SCHED_CLASS_EXT"    bash -c '! grep -q "CONFIG_SCHED_CLASS_EXT" arch/arm64/configs/gki_defconfig'
+chk "msm gki_defconfig 含 CONFIG_HMBIRD_SCHED=y" grep -q '^CONFIG_HMBIRD_SCHED=y' arch/arm64/configs/gki_defconfig
+chk "msm gki_defconfig 已无 CONFIG_SLIM_SCHED"     bash -c '! grep -q "CONFIG_SLIM_SCHED" arch/arm64/configs/gki_defconfig'
+chk "msm gki_defconfig 已无 CONFIG_SCHED_CLASS_EXT" bash -c '! grep -q "CONFIG_SCHED_CLASS_EXT" arch/arm64/configs/gki_defconfig'
 chk "walt.h 含 curr_runnable_sum_fixed"            grep -q 'curr_runnable_sum_fixed' kernel/sched/walt/walt.h
 chk "walt.h 含 prev_runnable_sum_fixed"            grep -q 'prev_runnable_sum_fixed' kernel/sched/walt/walt.h
 chk "sched.h 含 ANDROID_KABI_USE(6"                grep -q 'ANDROID_KABI_USE(6' include/linux/sched.h
@@ -281,15 +281,66 @@ echo "  补丁断言全部通过 ✅"
 # ─────────────────────────────────────────────────────────────────────────────
 banner "3. 注入配置项"
 
-python3 "$TOOLS_DIR/ci_apply_config.py" \
-  --defconfig "$KERNEL/arch/arm64/configs/gki_defconfig" \
-  --fragment  "$CONFIG_FRAG" \
-  --kconfig-dir "$KERNEL" \
-  --verify "$KERNEL/arch/arm64/configs/gki_defconfig"
+# ── 注入目标：common 树的 gki_defconfig（run#9 实测修正）──────────────────
+# 铁证（msm_kernel_la.bzl 的 define_msm_la）：
+#     if variant == "consolidate":
+#         base_kernel = "//common:kernel_aarch64_consolidate"
+#     else:
+#         base_kernel = "//common:kernel_aarch64"        ← perf 走这里
+#   → perf 变体的【内核配置】来自 common 树；msm-kernel 只是叠加层
+#     （提供源码 + in_tree_modules + build_config）。
+#   实证：run#9 最终 .config 里 CONFIG_SLIM_SCHED=y / CONFIG_SCHED_CLASS_EXT=y
+#         正是 common/arch/arm64/configs/gki_defconfig 第 13-14 行的原样内容；
+#         而 msm-kernel 的那两行已被风驰补丁删除 → 证明读的是 common 版。
+#   反向实证：run#9 里我们注入 msm-kernel/gki_defconfig 的 18 项，在构建日志中
+#         命中数全为 0 → 那份文件根本没被读取。
+#   另一条对照：CONFIG_OPLUS_CHG_V2=m 只写在 sun_perf.config（被合并）→ 充电模块
+#         正常编出（符号数 12=12 与 run#4 相同）→ 证明 sun_perf.config 生效。
+COMMON_KERNEL="$SRC/kernel_platform/common"
+[ -f "$COMMON_KERNEL/arch/arm64/configs/gki_defconfig" ] || die "common 树 gki_defconfig 不存在: $COMMON_KERNEL"
+echo "  注入目标（common 树）: $COMMON_KERNEL/arch/arm64/configs/gki_defconfig"
 
+python3 "$TOOLS_DIR/ci_apply_config.py" \
+  --defconfig "$COMMON_KERNEL/arch/arm64/configs/gki_defconfig" \
+  --fragment  "$CONFIG_FRAG" \
+  --kconfig-dir "$COMMON_KERNEL" \
+  --verify "$COMMON_KERNEL/arch/arm64/configs/gki_defconfig"
+
+# 风驰补丁已在 msm-kernel 的 gki_defconfig 里写了 CONFIG_HMBIRD_SCHED=y 并删了
+# SLIM_SCHED/SCHED_CLASS_EXT —— 但那只对 msm-kernel 生效，common 树仍需同样处理，
+# 否则 common 版的 SLIM_SCHED=y / SCHED_CLASS_EXT=y 会出现在最终 .config 里，
+# 与 HMBIRD_SCHED 并存（run#9 实测就是这个症状）。
+CG="$COMMON_KERNEL/arch/arm64/configs/gki_defconfig"
+if ! grep -q '^CONFIG_HMBIRD_SCHED=y' "$CG"; then
+  echo "  [注入] common gki_defconfig: 追加 CONFIG_HMBIRD_SCHED=y"
+  echo 'CONFIG_HMBIRD_SCHED=y' >> "$CG"
+fi
+for k in SLIM_SCHED SCHED_CLASS_EXT; do
+  if grep -q "^CONFIG_$k=y" "$CG"; then
+    sed -i "s/^CONFIG_$k=y/# CONFIG_$k is not set  # CI: 风驰替换/" "$CG"
+    echo "  [注入] common gki_defconfig: $k 已关闭"
+  fi
+done
 echo
-echo "=== 注入后 gki_defconfig 尾部 ==="
-tail -40 "$KERNEL/arch/arm64/configs/gki_defconfig"
+echo "=== 注入后 common gki_defconfig 尾部 ==="
+tail -40 "$CG"
+
+# ── 注入后校验（common 树，fail-fast）──────────────────────────────
+echo
+echo "=== common 树注入校验 ==="
+CFAIL=0
+cchk() { grep -q "$2" "$CG" && echo "  [OK]   $1" || { echo "  [FAIL] $1"; CFAIL=1; }; }
+ccno() { grep -q "$2" "$CG" && { echo "  [FAIL] $1（应已关闭）"; CFAIL=1; } || echo "  [OK]   $1"; }
+cchk "common: CONFIG_HMBIRD_SCHED=y"        '^CONFIG_HMBIRD_SCHED=y'
+ccno "common: CONFIG_SLIM_SCHED 已关闭"      '^CONFIG_SLIM_SCHED=y'
+ccno "common: CONFIG_SCHED_CLASS_EXT 已关闭" '^CONFIG_SCHED_CLASS_EXT=y'
+for k in SYSVIPC POSIX_MQUEUE IPC_NS DEVTMPFS TMPFS_POSIX_ACL TMPFS_XATTR \
+         NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT \
+         IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
+         MQ_IOSCHED_ADIOS MQ_IOSCHED_DEFAULT_ADIOS; do
+  cchk "common: CONFIG_$k=y" "^CONFIG_$k=y"
+done
+if [ "$CFAIL" -ne 0 ]; then die "common 树 gki_defconfig 注入校验失败"; fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 banner "4. --gki-headers（-g）：保护全部 7 个会被覆盖的补丁文件"
@@ -369,6 +420,14 @@ include/linux/sched/task.h
 include/uapi/linux/sched.h
 kernel/bpf/bpf_struct_ops_types.h
 kernel/sched/sched.h
+kernel/sched/core.c
+kernel/sched/build_policy.c
+kernel/sched/debug.c
+kernel/sched/idle.c
+kernel/fork.c
+kernel/time/tick-sched.c
+drivers/tty/sysrq.c
+init/init_task.c
 "
 PROTECT_LIST=$(echo "$PROTECT_LIST" | grep -v '^$')
 NPROT=$(echo "$PROTECT_LIST" | wc -l)
@@ -415,6 +474,14 @@ if [ -f "$GKI_LIST" ]; then
   echo "  清单中仍保留的 .h 行数: $NH（应为 3597 = 原 3604 减 7）"
   if [ "$NH" -ne 3597 ]; then
     die "清单里 .h 行数 = $NH（期望恰好 3597 = 3604-7）；过多说明保护不足，过少说明过度中和"
+  fi
+  # ── 复核 2b：总行数必须恰好 6771（6785-14）──
+  # 非 .h 的 7 个文件（kernel/sched/core.c 等）也会被 finally 的 git checkout
+  # 按同一清单还原，所以必须一并移出。之前只查 .h 是漏洞。
+  NTOT=$(wc -l < "$GKI_LIST")
+  echo "  清单总行数: $NTOT（应为 6771 = 原 6785 减 14）"
+  if [ "$NTOT" -ne 6771 ]; then
+    die "清单总行数 = $NTOT（期望恰好 6771 = 6785-14）；过多说明保护不足"
   fi
   # ── 复核 3：关键的新版头文件仍在清单里 ──
   for f in fs/verity/fsverity_private.h include/crypto/hash.h; do
@@ -468,6 +535,16 @@ else
   echo "  [FAIL] include/linux/cpufreq.h 行数 = $NCPL（< 1235，疑似已被 common 版覆盖）"
   FAIL=1
 fi
+
+# ★ 非 .h 文件的补丁内容断言（run#9 教训：它们也在清单里，会被 git checkout 还原）
+#   kernel/sched/build_policy.c 是 hmbird 的接入点（#include "hmbird/*.c"），
+#   被还原后 hmbird 符号数会变成 0（run#9 实测就是这个症状）。
+ck_has kernel/sched/build_policy.c        'hmbird/hmbird.c'              'hmbird/hmbird.c include（补丁新增）'
+ck_has kernel/sched/core.c                'CONFIG_HMBIRD_SCHED'          'HMBIRD 分支（补丁新增）'
+ck_has kernel/fork.c                      'hmbird'                       'hmbird 调用（补丁新增）'
+ck_has kernel/sched/idle.c                'hmbird'                       'hmbird 调用（补丁新增）'
+ck_has kernel/time/tick-sched.c           'hmbird'                       'hmbird 调用（补丁新增）'
+ck_has kernel/sched/debug.c               'hmbird'                       'hmbird 引用（补丁新增）'
 
 # ★ 关键：复核 4 的 FAIL 必须真的让脚本失败。
 #   历史缺陷：第 2 步末尾（约 273 行）检查过一次 FAIL，但复核 4 在其【之后】，
