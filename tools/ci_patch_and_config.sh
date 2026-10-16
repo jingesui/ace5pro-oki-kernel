@@ -433,6 +433,7 @@ kernel/fork.c
 kernel/time/tick-sched.c
 drivers/tty/sysrq.c
 init/init_task.c
+block/elevator.c
 "
 PROTECT_LIST=$(echo "$PROTECT_LIST" | grep -v '^$')
 NPROT=$(echo "$PROTECT_LIST" | wc -l)
@@ -486,9 +487,9 @@ if [ -f "$GKI_LIST" ]; then
   # 非 .h 的 7 个文件（kernel/sched/core.c 等）也会被 finally 的 git checkout
   # 按同一清单还原，所以必须一并移出。之前只查 .h 是漏洞。
   NTOT=$(wc -l < "$GKI_LIST")
-  echo "  清单总行数: $NTOT（应为 6770；原清单 wc -l = 6784，减 14）"
-  if [ "$NTOT" -ne 6770 ]; then
-    die "清单总行数 = $NTOT（期望 6770）；过多说明保护不足，过少说明过度中和"
+  echo "  清单总行数: $NTOT（应为 6769；原清单 wc -l = 6784，减 15）"
+  if [ "$NTOT" -ne 6769 ]; then
+    die "清单总行数 = $NTOT（期望 6769）；过多说明保护不足，过少说明过度中和"
   fi
   # ── 复核 3：关键的新版头文件仍在清单里 ──
   for f in fs/verity/fsverity_private.h include/crypto/hash.h; do
@@ -563,12 +564,15 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 
 # ── 复核 5：★ 穷举断言（不硬编码路径，未来自动拦截）──────────────────
-# 判据来源：补丁自身。从 patches/*.patch 提取所有"含 .h 且被修改（非新增/非删除）"
-# 的文件，与当前清单中的 .h 行取交集，必须为空。
-# 这样未来任何人往补丁里加新的 .h 文件、或上游改了清单，都会被自动拦住，
-# 不必再靠人肉列举。
+# 判据来源：补丁自身。从 patches/*.patch 提取所有【被修改】的文件
+# （不区分 .h 与非 .h，排除整文件新增/删除），与当前清单取交集，必须为空。
+#
+# ⚠️ run#14 前只查 .h 是个漏洞：block/elevator.c 是 .c 文件，adios.patch 改了它
+#   （默认电梯改 adios），它也在 GKI 清单第 542 行 → -g finally 的 git checkout
+#   会还原它 → ADIOS 默认调度器失效。而"只查 .h"的穷举发现不了。
+#   现已改为查全部文件类型，并把 elevator.c 加入保护名单。
 echo
-echo "=== 穷举断言：补丁修改的 .h 文件 与 清单 的交集必须为空 ==="
+echo "=== 穷举断言：补丁修改的文件（不分类型）与清单的交集必须为空 ==="
 python3 - "$PATCH_DIR" "$GKI_LIST" <<'PYEOF'
 import re, sys, glob, os
 patch_dir, gki = sys.argv[1], sys.argv[2]
@@ -583,8 +587,6 @@ for pat in sorted(glob.glob(os.path.join(patch_dir, "*.patch"))):
         if not m:
             continue
         f = m.group(1)
-        if not f.endswith(".h"):
-            continue
         first = "\n".join(b.split("\n")[1:5])
         # 整文件新增/删除不需要保护：
         #   新增 → common 里没有同名文件，-g 不会 symlink 到它
@@ -595,7 +597,7 @@ for pat in sorted(glob.glob(os.path.join(patch_dir, "*.patch"))):
 lines = [l.strip() for l in open(gki, errors="replace") if l.strip()]
 gki_set = set(lines)
 overlap = sorted(cand & gki_set)
-print("  补丁中【含 .h 且被修改】的文件数: %d" % len(cand))
+print("  补丁中【被修改】的文件数（不分类型）: %d" % len(cand))
 print("  当前清单中的条目数            : %d" % len(lines))
 print("  交集（会被 -g 覆盖的补丁文件） : %d" % len(overlap))
 for f in overlap:
