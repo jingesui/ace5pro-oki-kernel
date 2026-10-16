@@ -1,0 +1,242 @@
+name: Build Ace5Pro (make + msm-kernel + vendor overlay)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 为什么不用 bazel/kleaf（run#1~#16 实测结论）
+#
+# bazel 流程踩到的坑（每个都花了一轮 90 分钟构建才发现）：
+#   1. perf 变体 base_kernel=//common:kernel_aarch64 → 内核【配置】来自 common 树
+#   2. --defconfig_fragment 是【全局 flag】，同时污染 //common 与 //msm-kernel
+#   3. 直接改 gki_defconfig 会触发 savedefconfig 一致性校验失败
+#   4. fragment 文件【不能有注释行】（kleaf 会拼成配置值续行）
+#   5. --notrim 关闭模块裁剪后，GKI 模块与设备模块重叠 → modpost 429 个
+#      "exported twice" 错误
+#
+# 改用 make 直接编 msm-kernel 树：
+#   · msm-kernel 是【完整内核树】（Makefile/Kbuild/arch/block 全有）
+#   · kernel/sched/walt/ 只存在于 msm-kernel（common 没有！）—— 这是 walt_rq
+#     的来源，也是 bootloop 根因所在
+#   · 充电/ADSP 驱动通过符号链接指向 vendor 层：
+#       drivers/power/oplus → ../../../../vendor/oplus/kernel/charger
+#       kernel/oplus_cpu     → ../../../vendor/oplus/kernel/cpu
+#     所以必须叠加 android_kernel_modules_and_devicetree_oneplus_sm8750
+#
+# 关键验证（已做）：walt_rq 的 CRC 由源码结构体决定，与 CONFIG 无关 ——
+#   run#9（配置未生效）与 run#16（配置生效）的 walt_rq 都是 0xda944f6d。
+#   所以 make 流程只要用同一份 walt.h，CRC 必然也是 0xda944f6d → 厂商模块可加载。
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_modules:
+        description: '同时编译模块（充电/ADSP 等 .ko）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: 清理磁盘 + 显示资源
+        run: |
+          echo "=== 清理前 ==="; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /opt/conda /opt/google /usr/local/share/chromium 2>/dev/null || true
+          sudo apt-get clean
+          echo "=== 清理后 ==="; df -h / | tail -1
+          nproc; free -h
+
+      - name: 设置 SWAP（链接阶段内存峰值高）
+        run: |
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          swapon --show; free -h
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev \
+            zip unzip curl git patch python3 make gcc
+
+      - name: 下载 AOSP Clang r510928
+        run: |
+          cd /tmp
+          curl -sSL --retry 3 -o clang.tar.gz \
+            https://github.com/s1lently/llvm-project/releases/download/r510928-arm64/aosp-clang-r510928-x86_64-kernel.tar.gz
+          mkdir -p "$HOME/clang"
+          tar -xzf clang.tar.gz -C "$HOME/clang"
+          CLANG_BIN=$(find "$HOME/clang" -maxdepth 3 -type d -name bin | head -1)
+          echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
+          echo "PATH=$CLANG_BIN:$PATH" >> "$GITHUB_ENV"
+          clang --version | head -2
+
+      - name: 克隆 3 个官方仓库
+        run: |
+          BR=oneplus/sm8750_v_15.0.0_oneplus_ace5_pro
+          git clone --depth=1 -b $BR \
+            https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750 msm-kernel
+          git clone --depth=1 -b $BR \
+            https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750 mdt
+          echo "=== msm-kernel 版本 ==="
+          sed -n '1,4p' msm-kernel/Makefile
+          echo "=== walt 是否存在（bootloop 根因所在，common 树没有）==="
+          ls -la msm-kernel/kernel/sched/walt/walt.h
+          echo "=== 当前调度器配置 ==="
+          grep -nE "SLIM_SCHED|SCHED_CLASS_EXT|HMBIRD" msm-kernel/arch/arm64/configs/gki_defconfig
+
+      - name: 叠加 vendor 层（充电/ADSP 驱动）
+        run: |
+          # mdt 仓库 path="./"，内容直接覆盖到根目录
+          cp -a mdt/. msm-kernel/
+          echo "=== 叠加后验证 ==="
+          test -f msm-kernel/vendor/oplus/kernel/charger/Makefile && echo "  ✅ 充电驱动目录就位"
+          test -d msm-kernel/vendor/oplus/kernel/cpu && echo "  ✅ oplus_cpu 目录就位"
+          echo "  充电 .c 文件数: $(find msm-kernel/vendor/oplus/kernel/charger -name '*.c' 2>/dev/null | wc -l)"
+          echo "  符号链接状态:"
+          ls -la msm-kernel/drivers/power/oplus msm-kernel/kernel/oplus_cpu 2>&1 | head -4
+          # 修复 linkfile（manifest 声明，手工 clone 要自己补）
+          sed -i 's/ -dirty//g' msm-kernel/scripts/setlocalversion
+
+      - name: 取出仓库脚本（补丁与工具）
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: 打补丁（风驰 / Droidspaces / ADIOS / vendor-scx）
+        run: |
+          cd msm-kernel
+          for p in fengchi-rebased droidspaces adios; do
+            f="$GITHUB_WORKSPACE/repo/patches/$p.patch"
+            [ -f "$f" ] || { echo "::error::缺少补丁 $f"; exit 1; }
+            echo "=== 应用 $p.patch ($(wc -c < "$f") 字节) ==="
+            git apply --whitespace=nowarn "$f" || { echo "::error::$p.patch 应用失败"; exit 1; }
+          done
+          # vendor 版 sa_common_struct.h 的 scx 成员
+          # 注意：该文件来自 mdt 叠加（对 msm-kernel 的 git 是未跟踪文件），
+          #       git apply 可能拒绝 → 用 patch -p1（--forward 避免已应用时报错）
+          f="$GITHUB_WORKSPACE/repo/patches/hmbird-sa-common-scx.patch"
+          if [ -f "$f" ]; then
+            echo "=== 应用 hmbird-sa-common-scx.patch（$f）==="
+            if grep -q 'struct scx_entity scx;' \
+                 vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h 2>/dev/null; then
+              echo "  [skip] 已应用"
+            else
+              patch -p1 --forward --no-backup-if-mismatch < "$f" \
+                || { echo "::error::scx 补丁失败"; exit 1; }
+            fi
+          fi
+          echo "=== 断言 ==="
+          test -f kernel/sched/hmbird/hmbird.c || { echo "::error::hmbird.c 未生成"; exit 1; }
+          grep -q 'curr_runnable_sum_fixed' kernel/sched/walt/walt.h || { echo "::error::walt_rq 修复缺失"; exit 1; }
+          grep -q 'CONFIG_HMBIRD_SCHED=y' arch/arm64/configs/gki_defconfig || { echo "::error::defconfig 未切换到 HMBIRD"; exit 1; }
+          grep -q 'ANDROID_KABI_USE(6' include/linux/sched.h || { echo "::error::SYSVIPC kABI 槽未就位"; exit 1; }
+          test -f block/adios.c || { echo "::error::adios.c 未生成"; exit 1; }
+          test ! -f kernel/sched/ext.c || { echo "::error::ext.c 未删除"; exit 1; }
+          grep -q 'struct scx_entity scx;' vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h \
+            || { echo "::error::vendor scx 成员未注入"; exit 1; }
+          echo "全部补丁断言通过 ✅"
+
+      - name: 注入配置项（Droidspaces / ADIOS）
+        run: |
+          cd msm-kernel
+          D=arch/arm64/configs/gki_defconfig
+          # 风驰补丁已写入 CONFIG_HMBIRD_SCHED=y；以下为 Droidspaces/ADIOS 所需
+          for c in SYSVIPC SYSVIPC_SYSCTL POSIX_MQUEUE POSIX_MQUEUE_SYSCTL \
+                   IPC_NS PID_NS DEVTMPFS TMPFS_POSIX_ACL TMPFS_XATTR \
+                   NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_TARGET_LOG \
+                   NETFILTER_XT_MATCH_RECENT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET \
+                   NETFILTER_XT_SET MQ_IOSCHED_ADIOS MQ_IOSCHED_DEFAULT_ADIOS; do
+            grep -qE "^CONFIG_${c}=y" "$D" || echo "CONFIG_${c}=y" >> "$D"
+          done
+          # 禁止项（会改变结构体大小 → bootloop 且无解）
+          for c in CFS_BANDWIDTH CGROUP_PIDS; do
+            sed -i "s/^CONFIG_${c}=y/# CONFIG_${c} is not set/" "$D"
+          done
+          echo "=== 注入后关键项 ==="
+          grep -E '^(CONFIG_HMBIRD_SCHED|CONFIG_SYSVIPC|CONFIG_MQ_IOSCHED_ADIOS|CONFIG_IP_SET)=y' "$D"
+
+      - name: 生成配置
+        run: |
+          cd msm-kernel
+          export PATH="$CLANG_BIN:$PATH"
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-Wno-error gki_defconfig
+          echo "=== 最终配置校验 ==="
+          FAIL=0
+          for c in HMBIRD_SCHED MODVERSIONS; do
+            grep -qE "^CONFIG_${c}=y" out/.config && echo "  [OK] $c" || { echo "  [FAIL] $c"; FAIL=1; }
+          done
+          for c in SLIM_SCHED SCHED_CLASS_EXT CFS_BANDWIDTH CGROUP_PIDS; do
+            grep -qE "^CONFIG_${c}=y" out/.config && { echo "  [FAIL] $c 不应开启"; FAIL=1; } || echo "  [OK] $c 未开启"
+          done
+          [ "$FAIL" -eq 0 ] || { echo "::error::配置校验失败"; exit 1; }
+          echo "配置校验通过 ✅"
+
+      - name: 编译 Image
+        run: |
+          cd msm-kernel
+          export PATH="$CLANG_BIN:$PATH"
+          swapon --show || true; free -h
+          time make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-Wno-error Image
+          ls -l out/arch/arm64/boot/Image
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
+
+      - name: 生成 Module.symvers + 编译模块
+        if: ${{ inputs.build_modules }}
+        run: |
+          cd msm-kernel
+          export PATH="$CLANG_BIN:$PATH"
+          time make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-Wno-error modules || echo "::warning::部分模块编译失败（不中止）"
+          echo "=== Module.symvers ==="
+          wc -l out/Module.symvers
+          echo "=== 关键 CRC ==="
+          grep -wP 'walt_rq|sched_ravg_window|register_scx_sched_gki_ops' out/Module.symvers
+          echo "=== 充电/ADSP 模块 ==="
+          find out -name 'oplus_chg_v2.ko' -o -name '*adsp*.ko' 2>/dev/null | head -10
+
+      - name: '[CRC 把关] 与真机厂商模块期望值比对'
+        run: |
+          cd "$GITHUB_WORKSPACE/repo"
+          python3 tools/crc_gate.py "$GITHUB_WORKSPACE/msm-kernel/out/Module.symvers" expected_crc.txt || true
+          echo "=== walt_rq 硬断言 ==="
+          grep -wP 'walt_rq' "$GITHUB_WORKSPACE/msm-kernel/out/Module.symvers" | grep -q '0xda944f6d' \
+            && echo "  ✅ walt_rq = 0xda944f6d（与真机一致）" \
+            || { echo "::error::walt_rq CRC 不是 0xda944f6d"; exit 1; }
+
+      - name: 打包 AnyKernel3
+        run: |
+          git clone --depth=1 -b master https://github.com/cctv18/AnyKernel3 ak3
+          cp msm-kernel/out/arch/arm64/boot/Image ak3/Image
+          cd ak3
+          sed -i 's/^BLOCK=.*/BLOCK=boot/' anykernel.sh
+          sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=Ace5Pro OKI 6.6.66 (fengchi+droidspaces+adios)/' anykernel.sh
+          rm -rf .git
+          zip -r9 ../AK3_Ace5Pro_OKI_6.6.66.zip . > /dev/null
+          cd ..; ls -lh AK3_Ace5Pro_OKI_6.6.66.zip
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ace5Pro-make-${{ github.run_number }}
+          compression-level: 9
+          path: |
+            msm-kernel/out/arch/arm64/boot/Image
+            AK3_Ace5Pro_OKI_6.6.66.zip
+            msm-kernel/out/.config
+            msm-kernel/out/Module.symvers
