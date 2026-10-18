@@ -491,6 +491,8 @@ jobs:
           name: Ace5Pro-make-${{ github.run_number }}
           compression-level: 9
           if-no-files-found: error
+          # .config 是点开头的隐藏文件，v4 默认排除，必须显式打开
+          include-hidden-files: true
           path: |
             kernel_platform/msm-kernel/out/arch/arm64/boot/Image
             AK3_Ace5Pro_OKI_6.6.66.zip
