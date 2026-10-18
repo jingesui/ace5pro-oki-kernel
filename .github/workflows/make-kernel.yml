@@ -232,8 +232,13 @@ jobs:
             || { echo "::error::block/Kconfig.iosched 里没有 MQ_IOSCHED_ADIOS"; exit 1; }
           grep -q 'config MQ_IOSCHED_DEFAULT_ADIOS' block/Kconfig.iosched \
             || { echo "::error::block/Kconfig.iosched 里没有 MQ_IOSCHED_DEFAULT_ADIOS"; exit 1; }
-          grep -q 'CONFIG_HMBIRD_SCHED' kernel/Kconfig.preempt \
+          # Kconfig 里写的是 "config HMBIRD_SCHED"，没有 CONFIG_ 前缀
+          grep -qE '^config HMBIRD_SCHED$' kernel/Kconfig.preempt \
             || { echo "::error::kernel/Kconfig.preempt 里没有 HMBIRD_SCHED"; exit 1; }
+          # 旧符号必须已被删除
+          grep -qE '^config (SLIM_SCHED|SCHED_CLASS_EXT)$' kernel/Kconfig.preempt \
+            && { echo "::error::kernel/Kconfig.preempt 里 SLIM_SCHED/SCHED_CLASS_EXT 仍存在"; exit 1; } \
+            || true
           grep -q 'struct scx_entity scx;' \
                "$GITHUB_WORKSPACE/vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h" \
             || { echo "::error::vendor scx 成员未注入"; exit 1; }
