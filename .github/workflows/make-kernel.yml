@@ -1,37 +1,59 @@
-name: Build Ace5Pro (make + msm-kernel + vendor overlay)
+name: Build Ace5Pro (make + msm-kernel)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 为什么不用 bazel/kleaf（run#1~#16 实测结论）
-#
-# bazel 流程踩到的坑（每个都花了一轮 90 分钟构建才发现）：
+# 为什么放弃 bazel/kleaf（run#1~#16 实测，5 个硬阻塞，每个烧掉一轮 90 分钟）
 #   1. perf 变体 base_kernel=//common:kernel_aarch64 → 内核【配置】来自 common 树
 #   2. --defconfig_fragment 是【全局 flag】，同时污染 //common 与 //msm-kernel
 #   3. 直接改 gki_defconfig 会触发 savedefconfig 一致性校验失败
-#   4. fragment 文件【不能有注释行】（kleaf 会拼成配置值续行）
-#   5. --notrim 关闭模块裁剪后，GKI 模块与设备模块重叠 → modpost 429 个
-#      "exported twice" 错误
+#   4. fragment 文件不能有注释行（kleaf 会拼成配置值续行）
+#   5. build_with_bazel.py 的 -g（--gki-headers）把 common 树头文件符号链接覆盖到
+#      msm-kernel 上（run#16 日志 3597 条 "GKI header file..."，run#4 是 0 条）
+#      → 结构体布局被改 → vmlinux 侧 2170 个符号 CRC 冲突 → 厂商模块全拒绝加载
 #
-# 改用 make 直接编 msm-kernel 树：
-#   · msm-kernel 是【完整内核树】（Makefile/Kbuild/arch/block 全有）
-#   · kernel/sched/walt/ 只存在于 msm-kernel（common 没有！）—— 这是 walt_rq
-#     的来源，也是 bootloop 根因所在
-#   · 充电/ADSP 驱动通过符号链接指向 vendor 层：
-#       drivers/power/oplus → ../../../../vendor/oplus/kernel/charger
-#       kernel/oplus_cpu     → ../../../vendor/oplus/kernel/cpu
-#     所以必须叠加 android_kernel_modules_and_devicetree_oneplus_sm8750
+# make 直接编 msm-kernel 树：没有 prepare_vendor.sh、没有 -g、没有 common/msm 两套树
+# 混编，上面 5 个坑全部不存在。
 #
-# 关键验证（已做）：walt_rq 的 CRC 由源码结构体决定，与 CONFIG 无关 ——
-#   run#9（配置未生效）与 run#16（配置生效）的 walt_rq 都是 0xda944f6d。
-#   所以 make 流程只要用同一份 walt.h，CRC 必然也是 0xda944f6d → 厂商模块可加载。
+# ── 本轮新核实的三条事实（都是硬证据，直接决定流程）────────────────────────
+#
+# ① 真机 /proc/config.gz 与仓库里的 stock_config.txt md5 完全一致
+#      7db665b0e05496b358c2961204f8c09c，7743 行
+#    真机 vmlinux 配置里【没有】任何 CONFIG_OPLUS_*，也【没有】CONFIG_SCHED_WALT。
+#    但真机上 sched_walt.ko / oplus_chg_v2.ko 都在运行（lsmod 实测）。
+#    → 结论：充电栈与 WALT 全部是 vendor_dlkm 里的【模块】，由厂商用另一套
+#      vendor 配置（arch/arm64/configs/vendor/sun_perf.config）单独编译。
+#      它们不是我们 Image 的职责。我们的任务是让 Image 的 ABI 与它们兼容。
+#    → 所以【绝不能】把 sun_perf.config 合并进 vmlinux 配置：那是模块配置，
+#      合并进来会让 Image 多出一堆不该有的东西。run#4 的 config 恰好也没合并它，
+#      与真机只差 9 行 —— 这就是正确姿势的实证。
+#
+# ② 真机 vmlinux 配置 vs run#4 最终 config 的 9 行差异里，调度器占 4 行：
+#      真机: CONFIG_HMBIRD_SCHED=y
+#      run#4: CONFIG_SLIM_SCHED=y + CONFIG_SCHED_CLASS_EXT=y + CONFIG_EXT_GROUP_SCHED=y
+#    → 这是 run#4 bootloop 的直接原因（风驰符号缺失、调度类对不上）。
+#      本流程用风驰补丁把它换回来。
+#
+# ③ run#4（配置正确基线）的 vmlinux 导出对 495 个原厂模块的期望 CRC：
+#      由 vmlinux 提供的 3241 个符号，CRC 冲突 0
+#    这就是「ABI 对齐」的量化定义，也是本流程的验收闸门。
+#    （对照：run#16 因 -g 污染，同一指标是 2170 个冲突）
+#
+# ── 关键取舍 ────────────────────────────────────────────────────────────────
+#   · 用 gki_defconfig 直接生成配置，【不合并】sun_perf.config（见事实①）
+#   · CONFIG_TRIM_UNUSED_KSYMS 显式关闭：
+#       真机是 =y + UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"（靠 kleaf 注入
+#       这个字符串）。make 流程里没人注入 → 白名单为空 → modpost 会把非白名单
+#       导出符号【全部裁掉】，这是 run#8 bootloop 的机制。
+#       关掉 TRIM 只是"多导出符号"，对 CRC 无任何影响，且严格更安全。
+#   · 只产 Image + AnyKernel3，不产 vendor_dlkm（真机模块沿用原厂）
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
     inputs:
       build_modules:
-        description: '同时编译模块（充电/ADSP 等 .ko）'
+        description: '额外编译模块（仅自检用，产物不刷机）'
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -42,6 +64,11 @@ jobs:
     timeout-minutes: 350
 
     steps:
+      - name: 取出仓库脚本（补丁与工具）
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
       - name: 清理磁盘 + 显示资源
         run: |
           echo "=== 清理前 ==="; df -h / | tail -1
@@ -52,8 +79,12 @@ jobs:
           echo "=== 清理后 ==="; df -h / | tail -1
           nproc; free -h
 
-      - name: 设置 SWAP（链接阶段内存峰值高）
+      - name: 设置 SWAP
         run: |
+          # run#1 死在这一步：runner 镜像自带 /swapfile 且已启用，
+          # 直接 fallocate 会 "Text file busy"。必须先 swapoff 再删。
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
           sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
@@ -64,9 +95,27 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev \
-            zip unzip curl git patch python3 make gcc
+            zip unzip curl git patch python3 make gcc cpio rsync \
+            device-tree-compiler dwarves zstd openssl \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          echo "=== 工具版本 ==="
+          dtc --version | head -1
+          pahole --version
+          zstd --version
+          aarch64-linux-gnu-objcopy --version | head -1
+          # BTF 需要 pahole >= 1.25（真机 CONFIG_PAHOLE_VERSION=125）。
+          # 注意不能直接用浮点比：1.9 < 1.25 但 1.9 数值上 > 1.25。
+          # 必须按 major.minor 两个整数分别比较。
+          PAHOLE_V=$(pahole --version | grep -oP '\d+\.\d+' | head -1)
+          echo "pahole=$PAHOLE_V"
+          PAHOLE_OK=$(echo "$PAHOLE_V" | awk -F. '{ if ($1 > 1 || ($1 == 1 && $2 >= 25)) print "yes"; else print "no" }')
+          if [ "$PAHOLE_OK" != "yes" ]; then
+            echo "::warning::pahole $PAHOLE_V < 1.25，BTF 会关闭（对 ABI 无影响）"
+          else
+            echo "  ✅ pahole $PAHOLE_V 满足 BTF 要求"
+          fi
 
-      - name: 下载 AOSP Clang r510928
+      - name: 下载 AOSP Clang r510928（与真机同版本）
         run: |
           cd /tmp
           curl -sSL --retry 3 -o clang.tar.gz \
@@ -74,41 +123,59 @@ jobs:
           mkdir -p "$HOME/clang"
           tar -xzf clang.tar.gz -C "$HOME/clang"
           CLANG_BIN=$(find "$HOME/clang" -maxdepth 3 -type d -name bin | head -1)
+          [ -n "$CLANG_BIN" ] || { echo "::error::clang 解压后找不到 bin 目录"; exit 1; }
           echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
           echo "PATH=$CLANG_BIN:$PATH" >> "$GITHUB_ENV"
-          clang --version | head -2
+          "$CLANG_BIN/clang" --version | head -2
+          for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
+            test -x "$CLANG_BIN/$t" || { echo "::error::缺少工具 $t"; exit 1; }
+          done
+          echo "工具链完整 ✅"
 
-      - name: 克隆 3 个官方仓库
+      - name: 克隆 2 个官方仓库
         run: |
           BR=oneplus/sm8750_v_15.0.0_oneplus_ace5_pro
           git clone --depth=1 -b $BR \
             https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750 msm-kernel
           git clone --depth=1 -b $BR \
             https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750 mdt
-          echo "=== msm-kernel 版本 ==="
+          echo "=== 内核版本 ==="
           sed -n '1,4p' msm-kernel/Makefile
-          echo "=== walt 是否存在（bootloop 根因所在，common 树没有）==="
-          ls -la msm-kernel/kernel/sched/walt/walt.h
-          echo "=== 当前调度器配置 ==="
+          echo "=== walt.h 是否存在（bootloop 根因所在，common 树没有这个目录）==="
+          ls -l msm-kernel/kernel/sched/walt/walt.h
+          echo "=== 原始调度器配置 ==="
           grep -nE "SLIM_SCHED|SCHED_CLASS_EXT|HMBIRD" msm-kernel/arch/arm64/configs/gki_defconfig
+          df -h / | tail -1
 
-      - name: 叠加 vendor 层（充电/ADSP 驱动）
+      - name: 叠加 vendor 层（充电/ADSP 驱动源码）
         run: |
           # mdt 仓库 path="./"，内容直接覆盖到根目录
           cp -a mdt/. msm-kernel/
           echo "=== 叠加后验证 ==="
           test -f msm-kernel/vendor/oplus/kernel/charger/Makefile && echo "  ✅ 充电驱动目录就位"
-          test -d msm-kernel/vendor/oplus/kernel/cpu && echo "  ✅ oplus_cpu 目录就位"
-          echo "  充电 .c 文件数: $(find msm-kernel/vendor/oplus/kernel/charger -name '*.c' 2>/dev/null | wc -l)"
-          echo "  符号链接状态:"
-          ls -la msm-kernel/drivers/power/oplus msm-kernel/kernel/oplus_cpu 2>&1 | head -4
-          # 修复 linkfile（manifest 声明，手工 clone 要自己补）
+          test -f msm-kernel/vendor/oplus/kernel/cpu/Kconfig && echo "  ✅ oplus_cpu 目录就位"
+          echo "  充电 .c 文件数: $(find msm-kernel/vendor/oplus/kernel/charger -name '*.c' | wc -l)"
+          echo "=== 符号链接（决定 vendor 源码是否被编进内核）==="
+          ls -la msm-kernel/drivers/power/oplus msm-kernel/kernel/oplus_cpu
+          test -f msm-kernel/drivers/power/oplus/Kconfig \
+            || { echo "::error::drivers/power/oplus 符号链接未解析"; exit 1; }
+          test -f msm-kernel/kernel/oplus_cpu/Kconfig \
+            || { echo "::error::kernel/oplus_cpu 符号链接未解析"; exit 1; }
+          # 全量符号链接自检：drivers/soc/oplus/* 里有一堆指向 vendor 的链接，
+          # 任何一个断链都会让 make gki_defconfig 在 source Kconfig 时直接失败
+          BROKEN=0
+          while IFS= read -r lnk; do
+            if [ ! -e "$lnk" ]; then
+              echo "::error::断链: $lnk -> $(readlink "$lnk")"
+              BROKEN=$((BROKEN+1))
+            fi
+          done < <(find msm-kernel/drivers msm-kernel/kernel -maxdepth 4 -type l 2>/dev/null)
+          [ "$BROKEN" -eq 0 ] || { echo "::error::共 $BROKEN 个断链"; exit 1; }
+          echo "  ✅ 全部符号链接可解析"
+          # manifest 的 linkfile 手工 clone 要自己补
           sed -i 's/ -dirty//g' msm-kernel/scripts/setlocalversion
-
-      - name: 取出仓库脚本（补丁与工具）
-        uses: actions/checkout@v4
-        with:
-          path: repo
+          # mdt 里的 kernel_platform/ 是 bazel 用的，make 流程不需要，删掉避免干扰
+          rm -rf msm-kernel/kernel_platform
 
       - name: 打补丁（风驰 / Droidspaces / ADIOS / vendor-scx）
         run: |
@@ -119,36 +186,43 @@ jobs:
             echo "=== 应用 $p.patch ($(wc -c < "$f") 字节) ==="
             git apply --whitespace=nowarn "$f" || { echo "::error::$p.patch 应用失败"; exit 1; }
           done
-          # vendor 版 sa_common_struct.h 的 scx 成员
-          # 注意：该文件来自 mdt 叠加（对 msm-kernel 的 git 是未跟踪文件），
-          #       git apply 可能拒绝 → 用 patch -p1（--forward 避免已应用时报错）
+          # vendor 版 sa_common_struct.h 的 scx 成员：该文件来自 mdt 叠加，
+          # 对 msm-kernel 的 git 是未跟踪文件 → git apply 会拒绝，改用 patch -p1
           f="$GITHUB_WORKSPACE/repo/patches/hmbird-sa-common-scx.patch"
-          if [ -f "$f" ]; then
-            echo "=== 应用 hmbird-sa-common-scx.patch（$f）==="
-            if grep -q 'struct scx_entity scx;' \
-                 vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h 2>/dev/null; then
-              echo "  [skip] 已应用"
-            else
-              patch -p1 --forward --no-backup-if-mismatch < "$f" \
-                || { echo "::error::scx 补丁失败"; exit 1; }
-            fi
+          [ -f "$f" ] || { echo "::error::缺少 scx 补丁"; exit 1; }
+          if grep -q 'struct scx_entity scx;' \
+               vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h; then
+            echo "  [skip] scx 成员已存在"
+          else
+            patch -p1 --forward --no-backup-if-mismatch < "$f" \
+              || { echo "::error::scx 补丁失败"; exit 1; }
           fi
           echo "=== 断言 ==="
           test -f kernel/sched/hmbird/hmbird.c || { echo "::error::hmbird.c 未生成"; exit 1; }
+          test ! -f kernel/sched/ext.c || { echo "::error::ext.c 未删除"; exit 1; }
           grep -q 'curr_runnable_sum_fixed' kernel/sched/walt/walt.h || { echo "::error::walt_rq 修复缺失"; exit 1; }
-          grep -q 'CONFIG_HMBIRD_SCHED=y' arch/arm64/configs/gki_defconfig || { echo "::error::defconfig 未切换到 HMBIRD"; exit 1; }
+          grep -q 'CONFIG_HMBIRD_SCHED=y' arch/arm64/configs/gki_defconfig || { echo "::error::defconfig 未切到 HMBIRD"; exit 1; }
           grep -q 'ANDROID_KABI_USE(6' include/linux/sched.h || { echo "::error::SYSVIPC kABI 槽未就位"; exit 1; }
           test -f block/adios.c || { echo "::error::adios.c 未生成"; exit 1; }
-          test ! -f kernel/sched/ext.c || { echo "::error::ext.c 未删除"; exit 1; }
+          # 若 Kconfig 里没有这两个符号，后面写的 CONFIG_MQ_IOSCHED_*=y 会被
+          # kconfig 静默丢弃（不报错），必须在补丁阶段就抓住
+          grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched \
+            || { echo "::error::block/Kconfig.iosched 里没有 MQ_IOSCHED_ADIOS"; exit 1; }
+          grep -q 'config MQ_IOSCHED_DEFAULT_ADIOS' block/Kconfig.iosched \
+            || { echo "::error::block/Kconfig.iosched 里没有 MQ_IOSCHED_DEFAULT_ADIOS"; exit 1; }
+          grep -q 'CONFIG_HMBIRD_SCHED' kernel/Kconfig.preempt \
+            || { echo "::error::kernel/Kconfig.preempt 里没有 HMBIRD_SCHED"; exit 1; }
           grep -q 'struct scx_entity scx;' vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h \
             || { echo "::error::vendor scx 成员未注入"; exit 1; }
-          echo "全部补丁断言通过 ✅"
+          REJ=$(find . -name '*.rej' | wc -l)
+          [ "$REJ" -eq 0 ] || { echo "::error::存在 $REJ 个 .rej"; exit 1; }
+          echo "补丁断言全部通过 ✅"
 
-      - name: 注入配置项（Droidspaces / ADIOS）
+      - name: 注入配置项（Droidspaces / ADIOS / 关闭 TRIM）
         run: |
           cd msm-kernel
           D=arch/arm64/configs/gki_defconfig
-          # 风驰补丁已写入 CONFIG_HMBIRD_SCHED=y；以下为 Droidspaces/ADIOS 所需
+          # 风驰补丁已写入 CONFIG_HMBIRD_SCHED=y；以下为 Droidspaces / ADIOS 所需
           for c in SYSVIPC SYSVIPC_SYSCTL POSIX_MQUEUE POSIX_MQUEUE_SYSCTL \
                    IPC_NS PID_NS DEVTMPFS TMPFS_POSIX_ACL TMPFS_XATTR \
                    NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_TARGET_LOG \
@@ -156,28 +230,54 @@ jobs:
                    NETFILTER_XT_SET MQ_IOSCHED_ADIOS MQ_IOSCHED_DEFAULT_ADIOS; do
             grep -qE "^CONFIG_${c}=y" "$D" || echo "CONFIG_${c}=y" >> "$D"
           done
-          # 禁止项（会改变结构体大小 → bootloop 且无解）
+          # 禁止项：改变 cgroup/调度结构体 → 大面积 CRC 变化 → bootloop 且无解
           for c in CFS_BANDWIDTH CGROUP_PIDS; do
             sed -i "s/^CONFIG_${c}=y/# CONFIG_${c} is not set/" "$D"
+            grep -qE "^(CONFIG_${c}=y)" "$D" && { echo "::error::$c 仍为 y"; exit 1; }
+            echo "# CONFIG_${c} is not set" >> "$D"
           done
-          echo "=== 注入后关键项 ==="
-          grep -E '^(CONFIG_HMBIRD_SCHED|CONFIG_SYSVIPC|CONFIG_MQ_IOSCHED_ADIOS|CONFIG_IP_SET)=y' "$D"
+          # WERROR：真机是 y，但本树打了 4 个补丁（含一加扣留的风驰实现），
+          # 上游 CI 从没在这个组合上跑过 WERROR。为不让一条 warning 白烧 90 分钟，
+          # 显式关闭；WERROR 只影响编译期告警是否升级为错误，对生成的代码/ABI 零影响。
+          sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' "$D"
+          grep -qE '^CONFIG_WERROR=y' "$D" && { echo "::error::WERROR 仍为 y"; exit 1; }
+          grep -qE '^# CONFIG_WERROR is not set' "$D" \
+            || echo "# CONFIG_WERROR is not set" >> "$D"
+          # TRIM：必须显式关闭（make 流程没有 kleaf 注入白名单，开=裁空）
+          sed -i 's/^CONFIG_TRIM_UNUSED_KSYMS=y/# CONFIG_TRIM_UNUSED_KSYMS is not set/' "$D"
+          grep -qE '^CONFIG_TRIM_UNUSED_KSYMS=y' "$D" \
+            && { echo "::error::TRIM_UNUSED_KSYMS 仍为 y"; exit 1; }
+          grep -qE '^# CONFIG_TRIM_UNUSED_KSYMS is not set' "$D" \
+            || echo "# CONFIG_TRIM_UNUSED_KSYMS is not set" >> "$D"
+          echo "=== 注入结果 ==="
+          grep -E '^(CONFIG_HMBIRD_SCHED|CONFIG_SYSVIPC|CONFIG_MQ_IOSCHED_ADIOS|CONFIG_IP_SET|CONFIG_DEVTMPFS)=y' "$D"
+          grep -E 'CFS_BANDWIDTH|CGROUP_PIDS|TRIM_UNUSED_KSYMS' "$D"
 
       - name: 生成配置
         run: |
           cd msm-kernel
           export PATH="$CLANG_BIN:$PATH"
           make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
-            KCFLAGS+=-Wno-error gki_defconfig
-          echo "=== 最终配置校验 ==="
+            O=out gki_defconfig
+          echo "=== 配置校验 ==="
           FAIL=0
-          for c in HMBIRD_SCHED MODVERSIONS; do
-            grep -qE "^CONFIG_${c}=y" out/.config && echo "  [OK] $c" || { echo "  [FAIL] $c"; FAIL=1; }
-          done
-          for c in SLIM_SCHED SCHED_CLASS_EXT CFS_BANDWIDTH CGROUP_PIDS; do
-            grep -qE "^CONFIG_${c}=y" out/.config && { echo "  [FAIL] $c 不应开启"; FAIL=1; } || echo "  [OK] $c 未开启"
-          done
+          chk(){ grep -qE "^CONFIG_$1=y" out/.config && echo "  [OK] $1" || { echo "  [FAIL] $1 缺失"; FAIL=1; }; }
+          nchk(){ grep -qE "^CONFIG_$1=y" out/.config && { echo "  [FAIL] $1 不应开启"; FAIL=1; } || echo "  [OK] $1 未开启"; }
+          for c in HMBIRD_SCHED MODULES MODVERSIONS \
+                   SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS TMPFS_XATTR TMPFS_POSIX_ACL \
+                   MQ_IOSCHED_ADIOS MQ_IOSCHED_DEFAULT_ADIOS IP_SET NETFILTER_XT_SET; do chk $c; done
+          for c in SLIM_SCHED SCHED_CLASS_EXT CFS_BANDWIDTH CGROUP_PIDS TRIM_UNUSED_KSYMS; do nchk $c; done
+          # EXT_GROUP_SCHED 已被风驰补丁从 init/Kconfig 删除，符号本不该存在；
+          # 若出现说明补丁没打干净
+          grep -qE '^CONFIG_EXT_GROUP_SCHED' out/.config \
+            && { echo "  [FAIL] EXT_GROUP_SCHED 存在（风驰补丁未生效）"; FAIL=1; } \
+            || echo "  [OK] EXT_GROUP_SCHED 不存在"
+          # 风驰补丁删除的 ext.c 也不该以任何形式回来
+          grep -qE '^CONFIG_SCHED_CLASS_EXT' out/.config \
+            && { echo "  [FAIL] SCHED_CLASS_EXT 符号存在"; FAIL=1; } || true
+          echo "=== 关键行（应含 HMBIRD_SCHED=y，不含 SLIM_SCHED / TRIM_UNUSED_KSYMS）==="
+          grep -E 'HMBIRD_SCHED|SLIM_SCHED|TRIM_UNUSED_KSYMS|CFS_BANDWIDTH|CGROUP_PIDS' out/.config || true
+          echo "=== 配置总行数 ==="; wc -l out/.config
           [ "$FAIL" -eq 0 ] || { echo "::error::配置校验失败"; exit 1; }
           echo "配置校验通过 ✅"
 
@@ -185,38 +285,94 @@ jobs:
         run: |
           cd msm-kernel
           export PATH="$CLANG_BIN:$PATH"
-          swapon --show || true; free -h
+          swapon --show || true; free -h; df -h / | tail -1
           time make -j"$(nproc)" LLVM=1 ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
-            KCFLAGS+=-Wno-error Image
+            CROSS_COMPILE=aarch64-linux-gnu- O=out Image
           ls -l out/arch/arm64/boot/Image
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
 
-      - name: 生成 Module.symvers + 编译模块
+      - name: 收集 symvers（modpost 随 Image 一起产出）
+        run: |
+          cd msm-kernel
+          export PATH="$CLANG_BIN:$PATH"
+          ls -l out/vmlinux.symvers out/Module.symvers 2>/dev/null || true
+          if [ ! -s out/vmlinux.symvers ]; then
+            # 理论上不会走到这里（make Image 时 KBUILD_MODULES 为空，
+            # scripts/Makefile.modpost:147 必然走 vmlinux.symvers 分支）。
+            # 兜底只补 modpost 这一个目标：vmlinux.o 在 Image 阶段已生成，
+            # 重复 make vmlinux.o 只会浪费时间。
+            echo "::warning::未产出 vmlinux.symvers，补跑 modpost"
+            make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out modpost \
+              || echo "::warning::modpost 补跑失败"
+          fi
+          test -s out/vmlinux.symvers || { echo "::error::vmlinux.symvers 缺失，无法做 ABI 把关"; exit 1; }
+          wc -l out/vmlinux.symvers
+          echo "=== vmlinux 导出符号数 ==="
+          awk -F'\t' '$3=="vmlinux"' out/vmlinux.symvers | wc -l
+
+      - name: 编译模块（可选，自检用）
         if: ${{ inputs.build_modules }}
         run: |
           cd msm-kernel
           export PATH="$CLANG_BIN:$PATH"
           time make -j"$(nproc)" LLVM=1 ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
-            KCFLAGS+=-Wno-error modules || echo "::warning::部分模块编译失败（不中止）"
-          echo "=== Module.symvers ==="
-          wc -l out/Module.symvers
+            CROSS_COMPILE=aarch64-linux-gnu- O=out -k modules \
+            || echo "::warning::部分模块编译失败（不中止，Image 已产出）"
+          echo "=== .ko 数量 ==="; find out -name '*.ko' | wc -l
           echo "=== 关键 CRC ==="
-          grep -wP 'walt_rq|sched_ravg_window|register_scx_sched_gki_ops' out/Module.symvers
-          echo "=== 充电/ADSP 模块 ==="
-          find out -name 'oplus_chg_v2.ko' -o -name '*adsp*.ko' 2>/dev/null | head -10
+          grep -wP 'walt_rq|sched_ravg_window|register_scx_sched_gki_ops' out/Module.symvers || true
 
-      - name: '[CRC 把关] 与真机厂商模块期望值比对'
+      - name: '[闸门 1] 风驰必须编进 Image'
+        run: |
+          cd msm-kernel
+          IMG=out/arch/arm64/boot/Image
+          # ★ 不能只 grep -c hmbird：CONFIG_IKCONFIG=y 会把
+          #   "CONFIG_HMBIRD_SCHED=y" 当字符串编进 Image，风驰代码没编进去
+          #   也照样命中 → 闸门失效。
+          #   必须断言只可能来自 kernel/sched/hmbird/*.c 的函数符号。
+          #   实测基准：真机 stock Image 有 248 个 hmbird 字符串、且含下列函数；
+          #             run#4（SLIM_SCHED 版）为 0 个。
+          MISS=0
+          for sym in hmbird_sched_init_task hmbird_scheduler_tick hmbird_update_task_ravg \
+                     hmbird_sched_change_guard_init; do
+            if strings "$IMG" | grep -q "$sym"; then
+              echo "  [OK] $sym"
+            else
+              echo "::error::Image 里找不到风驰函数 $sym —— 风驰没编进去（run#4 bootloop 根因）"
+              MISS=1
+            fi
+          done
+          [ "$MISS" -eq 0 ] || exit 1
+          echo "=== hmbird 字符串总数（仅供参考，含 IKCONFIG 里的 config 名）==="
+          strings "$IMG" | grep -ci hmbird || true
+          echo "  ✅ 风驰代码确实已编入 Image"
+
+      - name: '[闸门 2] vmlinux 导出 CRC 对真机厂商模块'
         run: |
           cd "$GITHUB_WORKSPACE/repo"
-          python3 tools/crc_gate.py "$GITHUB_WORKSPACE/msm-kernel/out/Module.symvers" expected_crc.txt || true
-          echo "=== walt_rq 硬断言 ==="
-          grep -wP 'walt_rq' "$GITHUB_WORKSPACE/msm-kernel/out/Module.symvers" | grep -q '0xda944f6d' \
-            && echo "  ✅ walt_rq = 0xda944f6d（与真机一致）" \
-            || { echo "::error::walt_rq CRC 不是 0xda944f6d"; exit 1; }
+          python3 tools/crc_gate_vmlinux.py \
+            "$GITHUB_WORKSPACE/msm-kernel/out/vmlinux.symvers" expected_crc.txt
+
+      - name: '[闸门 3] 配置与真机一致性复核'
+        run: |
+          cd msm-kernel
+          FAIL=0
+          # 与真机 config 的调度器差异必须为 0
+          for c in HMBIRD_SCHED; do
+            grep -qE "^CONFIG_${c}=y" out/.config || { echo "::error::真机是 $c=y，我们不是"; FAIL=1; }
+          done
+          for c in SLIM_SCHED SCHED_CLASS_EXT; do
+            if grep -qE "^CONFIG_${c}=y" out/.config; then
+              echo "::error::$c 残留（真机没有）"; FAIL=1
+            fi
+          done
+          # Image 体积 sanity（真机 boot 分区装得下）
+          SZ=$(stat -c%s out/arch/arm64/boot/Image)
+          echo "Image 大小: $SZ 字节"
+          [ "$SZ" -gt 20000000 ] && [ "$SZ" -lt 80000000 ] \
+            || { echo "::error::Image 体积异常（$SZ）"; FAIL=1; }
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "配置一致性复核通过 ✅"
 
       - name: 打包 AnyKernel3
         run: |
@@ -228,15 +384,27 @@ jobs:
           sed -i 's/^kernel.string=.*/kernel.string=Ace5Pro OKI 6.6.66 (fengchi+droidspaces+adios)/' anykernel.sh
           rm -rf .git
           zip -r9 ../AK3_Ace5Pro_OKI_6.6.66.zip . > /dev/null
-          cd ..; ls -lh AK3_Ace5Pro_OKI_6.6.66.zip
+          cd ..
+          ls -lh AK3_Ace5Pro_OKI_6.6.66.zip
 
-      - name: 上传产物
+      - name: 上传必需产物（缺失即失败）
         uses: actions/upload-artifact@v4
         with:
           name: Ace5Pro-make-${{ github.run_number }}
           compression-level: 9
+          if-no-files-found: error
           path: |
             msm-kernel/out/arch/arm64/boot/Image
             AK3_Ace5Pro_OKI_6.6.66.zip
             msm-kernel/out/.config
+            msm-kernel/out/vmlinux.symvers
+
+      - name: 上传可选产物（缺失忽略）
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ace5Pro-make-${{ github.run_number }}-extras
+          compression-level: 9
+          if-no-files-found: ignore
+          path: |
             msm-kernel/out/Module.symvers
+            msm-kernel/out/modules-only.symvers
