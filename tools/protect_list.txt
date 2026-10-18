@@ -1,0 +1,7 @@
+include/asm-generic/vmlinux.lds.h
+include/linux/cpufreq.h
+include/linux/sched.h
+include/linux/sched/task.h
+include/uapi/linux/sched.h
+kernel/bpf/bpf_struct_ops_types.h
+kernel/sched/sched.h
