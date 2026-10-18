@@ -132,34 +132,43 @@ jobs:
           done
           echo "工具链完整 ✅"
 
-      - name: 克隆 2 个官方仓库
+      - name: 克隆 2 个官方仓库（严格按官方 repo 布局）
         run: |
           BR=oneplus/sm8750_v_15.0.0_oneplus_ace5_pro
+          # ★ 必须用 kernel_platform/msm-kernel/ 这个路径！
+          #   msm-kernel 里 drivers/power/oplus -> ../../../../vendor/oplus/kernel/charger
+          #   4 个 .. 意味着：drivers/power/oplus → drivers → msm-kernel →
+          #   kernel_platform → 仓库根。vendor 层在【仓库根】而不是 msm-kernel 里。
+          #   若把 msm-kernel 放根目录、vendor 放 kernel_platform/msm-kernel/vendor，
+          #   4 个 .. 会跳出到工作区根，符号链接全部断裂
+          #   （run#2 就是死在这里：make gki_defconfig 时 source Kconfig 失败）。
+          mkdir -p kernel_platform
           git clone --depth=1 -b $BR \
-            https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750 msm-kernel
+            https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750 kernel_platform/msm-kernel
           git clone --depth=1 -b $BR \
             https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750 mdt
           echo "=== 内核版本 ==="
-          sed -n '1,4p' msm-kernel/Makefile
+          sed -n '1,4p' kernel_platform/msm-kernel/Makefile
           echo "=== walt.h 是否存在（bootloop 根因所在，common 树没有这个目录）==="
-          ls -l msm-kernel/kernel/sched/walt/walt.h
+          ls -l kernel_platform/msm-kernel/kernel/sched/walt/walt.h
           echo "=== 原始调度器配置 ==="
-          grep -nE "SLIM_SCHED|SCHED_CLASS_EXT|HMBIRD" msm-kernel/arch/arm64/configs/gki_defconfig
+          grep -nE "SLIM_SCHED|SCHED_CLASS_EXT|HMBIRD" kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
           df -h / | tail -1
 
       - name: 叠加 vendor 层（充电/ADSP 驱动源码）
         run: |
-          # mdt 仓库 path="./"，内容直接覆盖到根目录
-          cp -a mdt/. msm-kernel/
-          echo "=== 叠加后验证 ==="
-          test -f msm-kernel/vendor/oplus/kernel/charger/Makefile && echo "  ✅ 充电驱动目录就位"
-          test -f msm-kernel/vendor/oplus/kernel/cpu/Kconfig && echo "  ✅ oplus_cpu 目录就位"
-          echo "  充电 .c 文件数: $(find msm-kernel/vendor/oplus/kernel/charger -name '*.c' | wc -l)"
+          # mdt 仓库 path="./" → 内容覆盖到【仓库根】，与 kernel_platform/ 平级。
+          # 这样 kernel_platform/msm-kernel/drivers/power/oplus -> ../../../../vendor/... 才能解析。
+          cp -a mdt/. .
+          echo "=== 叠加后验证（vendor 在仓库根，与 kernel_platform/ 平级）==="
+          test -f vendor/oplus/kernel/charger/Makefile && echo "  ✅ 充电驱动目录就位"
+          test -f vendor/oplus/kernel/cpu/Kconfig && echo "  ✅ oplus_cpu 目录就位"
+          echo "  充电 .c 文件数: $(find vendor/oplus/kernel/charger -name '*.c' | wc -l)"
           echo "=== 符号链接（决定 vendor 源码是否被编进内核）==="
-          ls -la msm-kernel/drivers/power/oplus msm-kernel/kernel/oplus_cpu
-          test -f msm-kernel/drivers/power/oplus/Kconfig \
+          ls -la kernel_platform/msm-kernel/drivers/power/oplus kernel_platform/msm-kernel/kernel/oplus_cpu
+          test -f kernel_platform/msm-kernel/drivers/power/oplus/Kconfig \
             || { echo "::error::drivers/power/oplus 符号链接未解析"; exit 1; }
-          test -f msm-kernel/kernel/oplus_cpu/Kconfig \
+          test -f kernel_platform/msm-kernel/kernel/oplus_cpu/Kconfig \
             || { echo "::error::kernel/oplus_cpu 符号链接未解析"; exit 1; }
           # 全量符号链接自检：drivers/soc/oplus/* 里有一堆指向 vendor 的链接，
           # 任何一个断链都会让 make gki_defconfig 在 source Kconfig 时直接失败
@@ -169,32 +178,45 @@ jobs:
               echo "::error::断链: $lnk -> $(readlink "$lnk")"
               BROKEN=$((BROKEN+1))
             fi
-          done < <(find msm-kernel/drivers msm-kernel/kernel -maxdepth 4 -type l 2>/dev/null)
+          done < <(find kernel_platform/msm-kernel/drivers kernel_platform/msm-kernel/kernel -maxdepth 4 -type l 2>/dev/null)
           [ "$BROKEN" -eq 0 ] || { echo "::error::共 $BROKEN 个断链"; exit 1; }
           echo "  ✅ 全部符号链接可解析"
           # manifest 的 linkfile 手工 clone 要自己补
-          sed -i 's/ -dirty//g' msm-kernel/scripts/setlocalversion
-          # mdt 里的 kernel_platform/ 是 bazel 用的，make 流程不需要，删掉避免干扰
-          rm -rf msm-kernel/kernel_platform
+          sed -i 's/ -dirty//g' kernel_platform/msm-kernel/scripts/setlocalversion
+          # mdt 自带的 kernel_platform/ 只有 bazel 相关（MODULE.bazel/build/oplus/
+          # qcom/tools），cp -a 会【合并】进我们已 clone 的 kernel_platform/，
+          # 不会删掉 msm-kernel。这里把 bazel 残留清掉，避免 make 流程误碰。
+          for d in build oplus qcom tools; do
+            [ -d "kernel_platform/$d" ] && rm -rf "kernel_platform/$d"
+          done
+          rm -f kernel_platform/MODULE.bazel kernel_platform/WORKSPACE \
+                kernel_platform/WORKSPACE.bzlmod 2>/dev/null || true
+          # msm-kernel 必须完好
+          test -f kernel_platform/msm-kernel/Makefile \
+            || { echo "::error::kernel_platform/msm-kernel 被破坏"; exit 1; }
 
       - name: 打补丁（风驰 / Droidspaces / ADIOS / vendor-scx）
         run: |
-          cd msm-kernel
+          cd kernel_platform/msm-kernel
           for p in fengchi-rebased droidspaces adios; do
             f="$GITHUB_WORKSPACE/repo/patches/$p.patch"
             [ -f "$f" ] || { echo "::error::缺少补丁 $f"; exit 1; }
             echo "=== 应用 $p.patch ($(wc -c < "$f") 字节) ==="
             git apply --whitespace=nowarn "$f" || { echo "::error::$p.patch 应用失败"; exit 1; }
           done
-          # vendor 版 sa_common_struct.h 的 scx 成员：该文件来自 mdt 叠加，
-          # 对 msm-kernel 的 git 是未跟踪文件 → git apply 会拒绝，改用 patch -p1
+          # vendor 版 sa_common_struct.h 的 scx 成员。
+          # ★ 该补丁的路径是 vendor/oplus/kernel/cpu/...，相对【仓库根】，
+          #   而 vendor 层在仓库根、msm-kernel 在 kernel_platform/ 下。
+          #   所以必须回仓库根打这个补丁，不能在 msm-kernel 里打。
           f="$GITHUB_WORKSPACE/repo/patches/hmbird-sa-common-scx.patch"
           [ -f "$f" ] || { echo "::error::缺少 scx 补丁"; exit 1; }
-          if grep -q 'struct scx_entity scx;' \
-               vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h; then
+          SCX_H="$GITHUB_WORKSPACE/vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h"
+          [ -f "$SCX_H" ] || { echo "::error::找不到 $SCX_H（vendor 层未叠加）"; exit 1; }
+          if grep -q 'struct scx_entity scx;' "$SCX_H"; then
             echo "  [skip] scx 成员已存在"
           else
-            patch -p1 --forward --no-backup-if-mismatch < "$f" \
+            ( cd "$GITHUB_WORKSPACE" && \
+              patch -p1 --forward --no-backup-if-mismatch < "$f" ) \
               || { echo "::error::scx 补丁失败"; exit 1; }
           fi
           echo "=== 断言 ==="
@@ -212,7 +234,8 @@ jobs:
             || { echo "::error::block/Kconfig.iosched 里没有 MQ_IOSCHED_DEFAULT_ADIOS"; exit 1; }
           grep -q 'CONFIG_HMBIRD_SCHED' kernel/Kconfig.preempt \
             || { echo "::error::kernel/Kconfig.preempt 里没有 HMBIRD_SCHED"; exit 1; }
-          grep -q 'struct scx_entity scx;' vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h \
+          grep -q 'struct scx_entity scx;' \
+               "$GITHUB_WORKSPACE/vendor/oplus/kernel/cpu/sched/sched_assist/sa_common_struct.h" \
             || { echo "::error::vendor scx 成员未注入"; exit 1; }
           REJ=$(find . -name '*.rej' | wc -l)
           [ "$REJ" -eq 0 ] || { echo "::error::存在 $REJ 个 .rej"; exit 1; }
@@ -220,7 +243,7 @@ jobs:
 
       - name: 注入配置项（Droidspaces / ADIOS / 关闭 TRIM）
         run: |
-          cd msm-kernel
+          cd kernel_platform/msm-kernel
           D=arch/arm64/configs/gki_defconfig
           # 风驰补丁已写入 CONFIG_HMBIRD_SCHED=y；以下为 Droidspaces / ADIOS 所需
           for c in SYSVIPC SYSVIPC_SYSCTL POSIX_MQUEUE POSIX_MQUEUE_SYSCTL \
@@ -255,7 +278,7 @@ jobs:
 
       - name: 生成配置
         run: |
-          cd msm-kernel
+          cd kernel_platform/msm-kernel
           export PATH="$CLANG_BIN:$PATH"
           make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             O=out gki_defconfig
@@ -283,7 +306,7 @@ jobs:
 
       - name: 编译 Image
         run: |
-          cd msm-kernel
+          cd kernel_platform/msm-kernel
           export PATH="$CLANG_BIN:$PATH"
           swapon --show || true; free -h; df -h / | tail -1
           time make -j"$(nproc)" LLVM=1 ARCH=arm64 \
@@ -293,7 +316,7 @@ jobs:
 
       - name: 收集 symvers（modpost 随 Image 一起产出）
         run: |
-          cd msm-kernel
+          cd kernel_platform/msm-kernel
           export PATH="$CLANG_BIN:$PATH"
           ls -l out/vmlinux.symvers out/Module.symvers 2>/dev/null || true
           if [ ! -s out/vmlinux.symvers ]; then
@@ -313,7 +336,7 @@ jobs:
       - name: 编译模块（可选，自检用）
         if: ${{ inputs.build_modules }}
         run: |
-          cd msm-kernel
+          cd kernel_platform/msm-kernel
           export PATH="$CLANG_BIN:$PATH"
           time make -j"$(nproc)" LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- O=out -k modules \
@@ -324,7 +347,7 @@ jobs:
 
       - name: '[闸门 1] 风驰必须编进 Image'
         run: |
-          cd msm-kernel
+          cd kernel_platform/msm-kernel
           IMG=out/arch/arm64/boot/Image
           # ★ 不能只 grep -c hmbird：CONFIG_IKCONFIG=y 会把
           #   "CONFIG_HMBIRD_SCHED=y" 当字符串编进 Image，风驰代码没编进去
@@ -351,11 +374,11 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/repo"
           python3 tools/crc_gate_vmlinux.py \
-            "$GITHUB_WORKSPACE/msm-kernel/out/vmlinux.symvers" expected_crc.txt
+            "$GITHUB_WORKSPACE/kernel_platform/msm-kernel/out/vmlinux.symvers" expected_crc.txt
 
       - name: '[闸门 3] 配置与真机一致性复核'
         run: |
-          cd msm-kernel
+          cd kernel_platform/msm-kernel
           FAIL=0
           # 与真机 config 的调度器差异必须为 0
           for c in HMBIRD_SCHED; do
@@ -377,7 +400,7 @@ jobs:
       - name: 打包 AnyKernel3
         run: |
           git clone --depth=1 -b master https://github.com/cctv18/AnyKernel3 ak3
-          cp msm-kernel/out/arch/arm64/boot/Image ak3/Image
+          cp kernel_platform/msm-kernel/out/arch/arm64/boot/Image ak3/Image
           cd ak3
           sed -i 's/^BLOCK=.*/BLOCK=boot/' anykernel.sh
           sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto/' anykernel.sh
@@ -394,10 +417,10 @@ jobs:
           compression-level: 9
           if-no-files-found: error
           path: |
-            msm-kernel/out/arch/arm64/boot/Image
+            kernel_platform/msm-kernel/out/arch/arm64/boot/Image
             AK3_Ace5Pro_OKI_6.6.66.zip
-            msm-kernel/out/.config
-            msm-kernel/out/vmlinux.symvers
+            kernel_platform/msm-kernel/out/.config
+            kernel_platform/msm-kernel/out/vmlinux.symvers
 
       - name: 上传可选产物（缺失忽略）
         uses: actions/upload-artifact@v4
@@ -406,5 +429,5 @@ jobs:
           compression-level: 9
           if-no-files-found: ignore
           path: |
-            msm-kernel/out/Module.symvers
-            msm-kernel/out/modules-only.symvers
+            kernel_platform/msm-kernel/out/Module.symvers
+            kernel_platform/msm-kernel/out/modules-only.symvers
