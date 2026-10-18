@@ -62,6 +62,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    env:
+      # 用于从公共仓库按 contents API 取单文件（common 树的新版头文件）。
+      # permissions.contents=read 已足够；github.token 自动可用，无需配置 secret。
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: 取出仓库脚本（补丁与工具）
@@ -154,6 +158,66 @@ jobs:
           echo "=== 原始调度器配置 ==="
           grep -nE "SLIM_SCHED|SCHED_CLASS_EXT|HMBIRD" kernel_platform/msm-kernel/arch/arm64/configs/gki_defconfig
           df -h / | tail -1
+
+      - name: 补齐 common 树的新版头文件（上游 msm-kernel 自身不一致）
+        run: |
+          # ★ 上游源码 bug：msm-kernel 的 fs/verity/verify.c 是【新版】
+          #   （用 crypto_shash_finup_mb / mb_max_msgs /
+          #     FS_VERITY_MAX_PENDING_DATA_BLOCKS），
+          #   但它自己的 fs/verity/fsverity_private.h 和 include/crypto/hash.h
+          #   还是【旧版】，两个文件里都没有这些符号。
+          #   实测（run#4）编译直接报 6 个 error：
+          #     fs/verity/verify.c:31:47: error: use of undeclared identifier
+          #         'FS_VERITY_MAX_PENDING_DATA_BLOCKS'
+          #     fs/verity/verify.c:323:8: error: call to undeclared function
+          #         'crypto_shash_finup_mb'
+          #     fs/verity/verify.c:347:44: error: no member named 'mb_max_msgs'
+          #   官方 kleaf 靠 build_with_bazel.py 的 -g（--gki-headers）把这些
+          #   头文件从 common 树符号链接过来，make 流程必须手动做同样的事。
+          #
+          #   只补【必需的两个】——历史上已用 kleaf 实测确认（多补会破坏
+          #   补丁对 include/linux/sched.h 等的改动，那是 run#8 bootloop 的坑）：
+          #     fs/verity/fsverity_private.h
+          #     include/crypto/hash.h
+          # 只取这 2 个文件，不 clone 整棵 common 树（省 2.1 GB 和 1-2 分钟）。
+          # 实测：ghproxy 对 include/crypto/hash.h 会失败，raw.githubusercontent
+          # 本身不稳；GitHub contents API（base64）两个文件都稳定成功。
+          BR=oneplus/sm8750_v_15.0.0_oneplus_ace5_pro
+          API="https://api.github.com/repos/OnePlusOSS/android_kernel_common_oneplus_sm8750/contents"
+          for f in fs/verity/fsverity_private.h include/crypto/hash.h; do
+            DST="kernel_platform/msm-kernel/$f"
+            if ! curl -sSfL --retry 3 --max-time 90 \
+                 -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/vnd.github+json" \
+                 "$API/$f?ref=$BR" -o "$DST.json"; then
+              echo "::error::下载 $f 失败"; exit 1
+            fi
+            # 用 python 单行（不换行）解析，避免 YAML 块标量缩进问题
+            if ! python3 -c "import json,sys,base64;d=json.load(open(sys.argv[1]));data=base64.b64decode(d['content']);open(sys.argv[2],'wb').write(data);print('  [OK] '+sys.argv[3]+' -> common ('+str(len(data))+' bytes)') if len(data)>=500 else sys.exit('too short')" "$DST.json" "$DST" "$f"; then
+              echo "::error::$f 解包失败"; exit 1
+            fi
+            rm -f "$DST.json"
+          done
+          echo "=== 断言：新 API 符号必须存在 ==="
+          grep -q 'FS_VERITY_MAX_PENDING_DATA_BLOCKS' \
+            kernel_platform/msm-kernel/fs/verity/fsverity_private.h \
+            || { echo "::error::fsverity_private.h 仍是旧版"; exit 1; }
+          grep -q 'mb_max_msgs' kernel_platform/msm-kernel/fs/verity/fsverity_private.h \
+            || { echo "::error::fsverity_private.h 缺 mb_max_msgs"; exit 1; }
+          grep -q 'crypto_shash_finup_mb' kernel_platform/msm-kernel/include/crypto/hash.h \
+            || { echo "::error::hash.h 仍是旧版"; exit 1; }
+          # ★ 依赖型断言：include/linux/cpufreq.h 必须保持【msm 版】。
+          #   补丁新增的 kernel/sched/hmbird/hmbird.c 调 store_scaling_governor、
+          #   hmbird_sched_proc.c 调 show_scaling_governor，这两个声明只在 msm 版
+          #   cpufreq.h 里（common 版没有）。若被换成 common 版，编译会报
+          #   "call to undeclared function"（kleaf 流程的 run#8 实测）。
+          #   make 流程不碰它，这里加断言防止将来误加进上面的替换列表。
+          grep -q 'store_scaling_governor' kernel_platform/msm-kernel/include/linux/cpufreq.h \
+            || { echo "::error::cpufreq.h 缺 store_scaling_governor（不能换成 common 版）"; exit 1; }
+          grep -q 'show_scaling_governor' kernel_platform/msm-kernel/include/linux/cpufreq.h \
+            || { echo "::error::cpufreq.h 缺 show_scaling_governor"; exit 1; }
+          echo "  ✅ cpufreq.h 保持 msm 版（依赖型文件未被误换）"
+          echo "  ✅ common 头文件补齐完成（只动 2 个文件）"
 
       - name: 叠加 vendor 层（充电/ADSP 驱动源码）
         run: |
